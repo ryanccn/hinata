@@ -12,11 +12,19 @@ use owo_colors::colors::Blue;
 
 use crate::logging::LogDisplay as _;
 
-pub const LIBRARY: [(&str, &str); 4] = [
-    ("flake.lock", include_str!("../flake.lock")),
-    ("nix/default.nix", include_str!("../nix/default.nix")),
-    ("nix/hinata.sh", include_str!("../nix/hinata.sh")),
-    ("nix/install.nix", include_str!("../nix/install.nix")),
+pub const LIBRARY: [(&str, &str); 3] = [
+    (
+        "nix_support/default.nix",
+        include_str!("./nix_support/default.nix"),
+    ),
+    (
+        "nix_support/hinata.sh",
+        include_str!("./nix_support/hinata.sh"),
+    ),
+    (
+        "nix_support/install.nix",
+        include_str!("./nix_support/install.nix"),
+    ),
 ];
 
 /// Nix evaluates from a temporary directory: reading a path makes it inspect the parent
@@ -53,7 +61,7 @@ pub fn build_workspace(
         .args(["--impure", "--print-out-paths", "--out-link"])
         .arg(out_link)
         .arg("--file")
-        .arg(dir.join("nix/install.nix"))
+        .arg(dir.join("nix_support/install.nix"))
         .args(["--arg", "dev", if dev { "true" } else { "false" }]);
 
     if let Some(major) = node_major {

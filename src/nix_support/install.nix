@@ -8,13 +8,11 @@
 }:
 
 let
-  flakeLock = builtins.fromJSON (builtins.readFile ../flake.lock);
-  nixpkgs = flakeLock.nodes.${flakeLock.nodes.${flakeLock.root}.inputs.nixpkgs}.locked;
   pkgs =
     import
       (builtins.fetchTarball {
-        url = "https://github.com/${nixpkgs.owner}/${nixpkgs.repo}/archive/${nixpkgs.rev}.tar.gz";
-        sha256 = nixpkgs.narHash;
+        url = "https://github.com/NixOS/nixpkgs/archive/02f5696b0e6097e589076d886b317b83ff0437d7.tar.gz";
+        sha256 = "sha256-llGJbC0CcU8DfROr6mZjRJgMLQd/SKwfpzxJH/2lHO4=";
       })
       {
         system = builtins.currentSystem;

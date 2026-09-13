@@ -54,6 +54,7 @@ struct ImporterRoots {
     optional_dependencies: BTreeMap<String, PathBuf>,
 }
 
+#[expect(clippy::too_many_lines)]
 pub fn run(options: &Options) -> Result<()> {
     let root = fs::canonicalize(&options.dir)
         .wrap_err_with(|| format!("opening {}", options.dir.display()))?;
