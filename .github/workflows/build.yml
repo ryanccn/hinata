@@ -29,17 +29,11 @@ jobs:
         target:
           - aarch64-apple-darwin
           - x86_64-apple-darwin
-          - aarch64-pc-windows-msvc
-          - x86_64-pc-windows-msvc
         include:
           - target: aarch64-apple-darwin
             runner: macos-latest
           - target: x86_64-apple-darwin
             runner: macos-latest
-          - target: aarch64-pc-windows-msvc
-            runner: windows-latest
-          - target: x86_64-pc-windows-msvc
-            runner: windows-latest
       fail-fast: false
 
     runs-on: ${{ matrix.runner }}
@@ -76,7 +70,6 @@ jobs:
         with:
           subject-path: |
             ./target/${{ matrix.target }}/release/hinata
-            ./target/${{ matrix.target }}/release/hinata.exe
 
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7.0.1
@@ -85,7 +78,6 @@ jobs:
           name: hinata-${{ matrix.target }}
           path: |
             ./target/${{ matrix.target }}/release/hinata
-            ./target/${{ matrix.target }}/release/hinata.exe
 
   linux-static:
     permissions:
