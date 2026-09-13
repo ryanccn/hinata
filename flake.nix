@@ -14,7 +14,7 @@
       root = ./.;
 
       flake.lib = {
-        mkHinata = pkgs: import ./nix { inherit pkgs; };
+        mkHinata = pkgs: import ./src/nix_support { inherit pkgs; };
       };
     };
 }

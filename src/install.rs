@@ -9,7 +9,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use eyre::{Result, WrapErr, eyre};
+use eyre::{Result, WrapErr, bail, eyre};
 use log::{debug, info, warn};
 use owo_colors::OwoColorize as _;
 use owo_colors::colors::{Blue, Yellow};
@@ -18,13 +18,16 @@ use serde::Deserialize;
 use crate::lock::{self, Lock};
 use crate::logging::{LogDisplay as _, plural};
 use crate::registry::{DEFAULT_REGISTRY, HttpRegistry};
-use crate::{link, manifest, nix, resolve};
+use crate::{link, manifest, nix, pnpm, resolve};
+
+const LOCKFILE: &str = "hinata.lock";
 
 pub struct Options {
     pub dir: PathBuf,
     pub dev: bool,
     pub refresh: bool,
     pub update: Update,
+    pub save_lock: bool,
 }
 
 pub enum Update {
@@ -58,8 +61,8 @@ struct ImporterRoots {
 pub fn run(options: &Options) -> Result<()> {
     let root = fs::canonicalize(&options.dir)
         .wrap_err_with(|| format!("opening {}", options.dir.display()))?;
-    let lock_path = root.join("hinata.lock");
-    let (lock, lock_json) = update_lock(&root, &lock_path, options)?;
+    let lock_path = root.join(LOCKFILE);
+    let (lock, lock_json, lock_file) = update_lock(&root, &lock_path, options)?;
 
     let cache = cache_dir()?;
     let gcroots = cache.join("gcroots");
@@ -92,7 +95,7 @@ pub fn run(options: &Options) -> Result<()> {
         Some(workspace) if !options.refresh => {
             info!(
                 "{} is unchanged since the last install, skipping the Nix build {}",
-                "hinata.lock".log_display::<Blue>(),
+                lock_file.log_display::<Blue>(),
                 "(pass --refresh to rebuild)".dimmed()
             );
             workspace
@@ -167,15 +170,27 @@ pub fn run(options: &Options) -> Result<()> {
     Ok(())
 }
 
-fn update_lock(root: &Path, lock_path: &Path, options: &Options) -> Result<(Lock, String)> {
+#[expect(clippy::too_many_lines)]
+fn update_lock(
+    root: &Path,
+    lock_path: &Path,
+    options: &Options,
+) -> Result<(Lock, String, &'static str)> {
     let manifest = manifest::read(root)?;
     let existing = match fs::read_to_string(lock_path) {
         Ok(json) => Some(serde_json::from_str::<Lock>(&json).wrap_err("parsing hinata.lock")?),
         Err(error) if error.kind() == ErrorKind::NotFound => None,
         Err(error) => return Err(error).wrap_err("reading hinata.lock"),
     };
+    let pnpm_lock = match existing {
+        Some(_) => None,
+        None => pnpm::read(root)?,
+    };
+    let from_pnpm = pnpm_lock.is_some();
 
-    if let (Update::Only(names), Some(lock)) = (&options.update, &existing) {
+    if let (Update::Only(names), Some(lock)) =
+        (&options.update, existing.as_ref().or(pnpm_lock.as_ref()))
+    {
         for name in names {
             if !lock.packages.values().any(|package| &package.name == name) {
                 warn!(
@@ -186,27 +201,51 @@ fn update_lock(root: &Path, lock_path: &Path, options: &Options) -> Result<(Lock
         }
     }
 
+    let specifiers = pnpm::without_runtimes(&manifest.specifiers);
     let current = |lock: &Lock| {
         lock.version == lock::VERSION
             && lock
                 .importers
                 .get(".")
-                .is_some_and(|root| root.specifiers == manifest.specifiers)
+                .is_some_and(|root| root.specifiers == specifiers)
     };
-    let mut lock = match existing {
-        Some(lock) if matches!(options.update, Update::Keep) && current(&lock) => {
+    let keep = matches!(options.update, Update::Keep);
+    let (mut lock, pnpm_only) = match (existing, pnpm_lock) {
+        (Some(lock), _) if keep && current(&lock) => {
             debug!(
                 "{} matches package.json, not resolving again",
-                "hinata.lock".log_display::<Blue>()
+                LOCKFILE.log_display::<Blue>()
             );
-            lock
+            (lock, false)
         }
-        existing => {
+        (None, Some(mut lock)) if keep && current(&lock) => {
+            if options.save_lock {
+                info!(
+                    "looking up install scripts in {}",
+                    DEFAULT_REGISTRY.log_display::<Blue>()
+                );
+                pnpm::fill_install_scripts(&mut lock, &HttpRegistry::new(DEFAULT_REGISTRY)?)?;
+                (lock, false)
+            } else {
+                debug!(
+                    "{} matches package.json, installing from it",
+                    pnpm::LOCKFILE.log_display::<Blue>()
+                );
+                (lock, true)
+            }
+        }
+        (None, Some(_)) if !options.save_lock => bail!(
+            "{} does not match package.json; run `pnpm install` to update it, or `hinata install --save-lock` to resolve dependencies into {} instead",
+            pnpm::LOCKFILE,
+            LOCKFILE
+        ),
+        (existing, pnpm_lock) => {
             info!(
                 "resolving dependencies from {}",
                 DEFAULT_REGISTRY.log_display::<Blue>()
             );
             let preferred: Vec<(String, String)> = existing
+                .or(pnpm_lock)
                 .map(|lock| {
                     lock.packages
                         .into_values()
@@ -221,14 +260,16 @@ fn update_lock(root: &Path, lock_path: &Path, options: &Options) -> Result<(Lock
                 "resolved {}",
                 plural(lock.packages.len(), "package", "packages")
             );
-            lock
+            (lock, false)
         }
     };
 
     let allow_builds = manifest.allow_builds();
     let mut skipped = BTreeSet::new();
     for package in lock.packages.values_mut() {
-        package.build = package.install_script && allow_builds.contains(&package.name);
+        // pnpm lockfiles do not record which packages have install scripts.
+        package.build =
+            allow_builds.contains(&package.name) && (pnpm_only || package.install_script);
         if package.install_script && !package.build {
             skipped.insert(package.name.clone());
         }
@@ -246,20 +287,31 @@ fn update_lock(root: &Path, lock_path: &Path, options: &Options) -> Result<(Lock
     }
 
     let json = lock::to_json(&lock)?;
+    if pnpm_only {
+        return Ok((lock, json, pnpm::LOCKFILE));
+    }
     let previous = fs::read_to_string(lock_path).ok();
     if previous.as_deref() != Some(json.as_str()) {
         fs::write(lock_path, &json).wrap_err("writing hinata.lock")?;
         info!(
-            "{} {}",
+            "{} {}{}",
             if previous.is_some() {
                 "updated"
             } else {
                 "created"
             },
-            "hinata.lock".log_display::<Blue>()
+            LOCKFILE.log_display::<Blue>(),
+            if from_pnpm {
+                format!(
+                    ", which takes precedence over {} from now on",
+                    pnpm::LOCKFILE.log_display::<Blue>()
+                )
+            } else {
+                String::new()
+            }
         );
     }
-    Ok((lock, json))
+    Ok((lock, json, LOCKFILE))
 }
 
 /// `DefaultHasher` output is only stable within one build of hinata.
@@ -332,6 +384,66 @@ fn prune_cache(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installs_from_a_matching_pnpm_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = |range: &str| {
+            format!(
+                r#"{{ "dependencies": {{ "a": "{range}", "b": "^1.0.0" }}, "devDependencies": {{ "node": "runtime:22.18.0" }}, "hinata": {{ "allowBuilds": ["a"] }} }}"#
+            )
+        };
+        fs::write(dir.path().join("package.json"), manifest("^1.0.0")).unwrap();
+        fs::write(
+            dir.path().join(pnpm::LOCKFILE),
+            "lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      a:
+        specifier: ^1.0.0
+        version: 1.0.0
+      b:
+        specifier: ^1.0.0
+        version: 1.0.0
+    devDependencies:
+      node:
+        specifier: runtime:22.18.0
+        version: runtime:22.18.0
+packages:
+  a@1.0.0:
+    resolution: {integrity: sha512-a}
+  b@1.0.0:
+    resolution: {integrity: sha512-b}
+  node@runtime:22.18.0:
+    resolution: {type: variations, variants: []}
+snapshots:
+  a@1.0.0: {}
+  b@1.0.0: {}
+  node@runtime:22.18.0: {}
+",
+        )
+        .unwrap();
+        let options = Options {
+            dir: dir.path().to_path_buf(),
+            dev: true,
+            refresh: false,
+            update: Update::Keep,
+            save_lock: false,
+        };
+        let lock_path = dir.path().join(LOCKFILE);
+
+        let (lock, _, file) = update_lock(dir.path(), &lock_path, &options).unwrap();
+        assert_eq!(file, pnpm::LOCKFILE);
+        assert!(lock.packages["a@1.0.0"].build);
+        assert!(!lock.packages["b@1.0.0"].build);
+        assert!(!lock_path.exists());
+
+        fs::write(dir.path().join("package.json"), manifest("^2.0.0")).unwrap();
+        let error = update_lock(dir.path(), &lock_path, &options).unwrap_err();
+        assert!(error.to_string().contains("pnpm install"));
+        assert!(!lock_path.exists());
+    }
 
     #[test]
     fn escapes_paths_reversibly() {

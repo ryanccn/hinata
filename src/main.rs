@@ -9,6 +9,7 @@ mod lock;
 mod logging;
 mod manifest;
 mod nix;
+mod pnpm;
 mod registry;
 mod resolve;
 mod run;
@@ -46,6 +47,9 @@ enum Command {
         /// Build even if nothing changed since the last install
         #[arg(long)]
         refresh: bool,
+        /// Write hinata.lock when installing from pnpm-lock.yaml
+        #[arg(long)]
+        save_lock: bool,
     },
     /// Add dependencies to package.json and install them
     Add {
@@ -94,12 +98,18 @@ fn main() -> Result<()> {
         dev: true,
         refresh: false,
         update,
+        save_lock: true,
     };
 
     match cli.command {
-        Command::Install { prod, refresh } => install::run(&install::Options {
+        Command::Install {
+            prod,
+            refresh,
+            save_lock,
+        } => install::run(&install::Options {
             dev: !prod,
             refresh,
+            save_lock,
             ..install(Update::Keep)
         })?,
         Command::Add {

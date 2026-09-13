@@ -34,6 +34,10 @@ allowBuilds:
   esbuild: true
 ```
 
+## pnpm
+
+Without a `hinata.lock`, `hinata install` installs from `pnpm-lock.yaml` (lockfile version 9.0) as long as it matches `package.json`, and leaves both files untouched. `hinata install --save-lock`, `add`, `remove` and `update` write a `hinata.lock`, which takes precedence from then on. The Nix library only reads `hinata.lock`.
+
 ## Nix
 
 The flake exposes the library for building apps without a dependency hash:
