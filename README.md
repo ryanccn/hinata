@@ -27,7 +27,12 @@ Install scripts only run for packages listed in `package.json`:
 { "hinata": { "allowBuilds": ["esbuild"] } }
 ```
 
-`pnpm.allowBuilds` is honored as well.
+`allowBuilds` in `pnpm-workspace.yaml` is honored as well:
+
+```yaml
+allowBuilds:
+  esbuild: true
+```
 
 ## Nix
 

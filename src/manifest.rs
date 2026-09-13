@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use eyre::{Result, WrapErr, bail};
@@ -23,8 +24,8 @@ pub struct Manifest {
     pub scripts: BTreeMap<String, String>,
     #[serde(default)]
     hinata: HinataConfig,
-    #[serde(default)]
-    pnpm: PnpmConfig,
+    #[serde(skip)]
+    workspace: PnpmWorkspace,
 }
 
 #[derive(Deserialize, Default)]
@@ -36,16 +37,23 @@ struct HinataConfig {
 
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-struct PnpmConfig {
+struct PnpmWorkspace {
     #[serde(default)]
-    allow_builds: BTreeSet<String>,
+    allow_builds: BTreeMap<String, bool>,
 }
 
 impl Manifest {
     pub fn allow_builds(&self) -> BTreeSet<String> {
+        let workspace = self
+            .workspace
+            .allow_builds
+            .iter()
+            .filter(|(_, allowed)| **allowed)
+            .map(|(name, _)| name);
         self.hinata
             .allow_builds
-            .union(&self.pnpm.allow_builds)
+            .iter()
+            .chain(workspace)
             .cloned()
             .collect()
     }
@@ -55,7 +63,19 @@ pub fn read(dir: &Path) -> Result<Manifest> {
     let path = dir.join("package.json");
     let source =
         fs::read_to_string(&path).wrap_err_with(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&source).wrap_err_with(|| format!("parsing {}", path.display()))
+    let mut manifest: Manifest =
+        serde_json::from_str(&source).wrap_err_with(|| format!("parsing {}", path.display()))?;
+
+    let path = dir.join("pnpm-workspace.yaml");
+    match fs::read_to_string(&path) {
+        Ok(source) => {
+            manifest.workspace = serde_yaml::from_str(&source)
+                .wrap_err_with(|| format!("parsing {}", path.display()))?;
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).wrap_err_with(|| format!("reading {}", path.display())),
+    }
+    Ok(manifest)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,11 +210,16 @@ mod tests {
     }
 
     #[test]
-    fn reads_build_allowlists_from_hinata_and_pnpm() {
+    fn reads_build_allowlists_from_hinata_and_pnpm_workspace() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("package.json"),
-            r#"{ "name": "app", "dependencies": { "a": "^1" }, "hinata": { "allowBuilds": ["esbuild"] }, "pnpm": { "allowBuilds": ["sharp"] } }"#,
+            r#"{ "name": "app", "dependencies": { "a": "^1" }, "hinata": { "allowBuilds": ["esbuild"] } }"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "allowBuilds:\n  sharp: true\n  core-js: false\n",
         )
         .unwrap();
 
