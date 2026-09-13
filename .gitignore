@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: 2026 Ryan Cao <hello@ryanccn.dev>
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+/target
+
+result
+result-*
+node_modules/

@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: 2026 Ryan Cao <hello@ryanccn.dev>
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+name: Check
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    outputs:
+      checks: ${{ steps.checks.outputs.checks }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # ratchet:cachix/install-nix-action@v31.11.1
+
+      - name: Collect checks
+        id: checks
+        run: |
+          echo "checks=$(nix eval --impure --json --expr 'builtins.attrNames (builtins.getFlake (toString ./.)).checks.${builtins.currentSystem}')" >> "$GITHUB_OUTPUT"
+
+  check:
+    needs: collect
+    strategy:
+      matrix:
+        check: ${{ fromJson(needs.collect.outputs.checks) }}
+      fail-fast: false
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # ratchet:cachix/install-nix-action@v31
+
+      - name: Check
+        run: nix build --fallback --print-build-logs '.#checks.x86_64-linux.${{ matrix.check }}'
+
+      - name: Upload Clippy results
+        if: ${{ matrix.check == 'clippy' }}
+        uses: github/codeql-action/upload-sarif@977e6ceaea7361825998245d787fa3b4d6b9e5df # ratchet:github/codeql-action/upload-sarif@codeql-bundle-v2.27.0
+        with:
+          sarif_file: result
+          wait-for-processing: true
