@@ -16,6 +16,7 @@ use log::debug;
 use reqwest::StatusCode;
 use reqwest::header::{ACCEPT, ETAG, HeaderName, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED};
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -45,7 +46,7 @@ pub struct Packument {
     pub dist_tags: BTreeMap<String, String>,
     /// Left unparsed: only chosen versions are read, and some old versions are malformed.
     #[serde(default)]
-    pub versions: BTreeMap<String, serde_json::Value>,
+    pub versions: BTreeMap<String, Box<RawValue>>,
 }
 
 #[derive(Deserialize)]

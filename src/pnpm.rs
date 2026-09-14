@@ -88,6 +88,13 @@ pub fn read(root: &Path) -> Result<Option<Lock>> {
         .wrap_err_with(|| format!("parsing {}", path.display()))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallScript {
+    #[serde(default)]
+    has_install_script: bool,
+}
+
 pub fn fill_install_scripts(lock: &mut Lock, registry: &dyn Registry) -> Result<()> {
     let mut versions: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for package in lock.packages.values() {
@@ -122,10 +129,8 @@ pub fn fill_install_scripts(lock: &mut Lock, registry: &dyn Registry) -> Result<
             .versions
             .get(&package.version)
             .ok_or_else(|| eyre!("{id} is not in the registry"))?;
-        package.install_script = manifest
-            .get("hasInstallScript")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        package.install_script = serde_json::from_str::<InstallScript>(manifest.get())
+            .is_ok_and(|manifest| manifest.has_install_script);
     }
     Ok(())
 }
@@ -494,7 +499,9 @@ snapshots:
                     } else {
                         json!({ "1.0.0": {}, "2.0.0": {}, "6.0.1": {}, "18.3.1": {} })
                     };
-                    Ok(serde_json::from_value(json!({ "versions": versions }))?)
+                    Ok(serde_json::from_str(
+                        &json!({ "versions": versions }).to_string(),
+                    )?)
                 })
                 .collect()
         }

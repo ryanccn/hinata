@@ -370,8 +370,8 @@ impl<'r> Chooser<'r> {
 
     fn add_node(&mut self, key: &str) -> Result<()> {
         let (name, version) = key.rsplit_once('@').expect("node keys are name@version");
-        let raw = self.packuments[name].packument.versions[version].clone();
-        let manifest: VersionManifest = serde_json::from_value(raw)
+        let raw = &self.packuments[name].packument.versions[version];
+        let manifest: VersionManifest = serde_json::from_str(raw.get())
             .wrap_err_with(|| format!("reading the registry metadata of {key}"))?;
         let peers = manifest
             .peer_dependencies
@@ -867,7 +867,7 @@ mod tests {
                         .packuments
                         .get(name)
                         .ok_or_else(|| eyre!("{name} is not in the registry"))?;
-                    Ok(serde_json::from_value(packument.clone())?)
+                    Ok(serde_json::from_str(&packument.to_string())?)
                 })
                 .collect()
         }
@@ -875,7 +875,7 @@ mod tests {
         fn cached(&self, names: &[String]) -> Vec<Option<Packument>> {
             names
                 .iter()
-                .map(|name| serde_json::from_value(self.cache.get(name)?.clone()).ok())
+                .map(|name| serde_json::from_str(&self.cache.get(name)?.to_string()).ok())
                 .collect()
         }
     }

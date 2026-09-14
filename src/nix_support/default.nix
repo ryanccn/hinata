@@ -105,11 +105,14 @@ let
 
       fetchPackage =
         p:
-        pkgs.fetchurl {
+        (pkgs.fetchurl {
           name = "${lib.strings.sanitizeDerivationName "${p.name}-${p.version}"}.tgz";
           url = p.url;
           hash = p.integrity;
-        };
+        }).overrideAttrs
+          (_: {
+            allowSubstitutes = false;
+          });
 
       # Dependencies are linked beside the package so that relative paths from native addons to
       # sibling packages resolve.
@@ -140,47 +143,55 @@ let
         let
           first = packages.${lib.head members};
           needsBuild = lib.any (id: packages.${id}.build or false) members;
-          name =
+          name = lib.strings.sanitizeDerivationName (
             if lib.length members == 1 then
               "${first.name}-${first.version}"
             else
-              "hinata-cycle-${first.name}-${first.version}";
-          runCommand = if needsBuild then pkgs.runCommandCC else pkgs.runCommand;
-        in
-        runCommand (lib.strings.sanitizeDerivationName name)
-          (
-            {
-              nativeBuildInputs = [
-                pkgs.jq
-              ]
-              ++ lib.optionals needsBuild [
-                nodejs
-                pkgs.python3
-              ]
-              # node-gyp on darwin needs libtool and xcrun, which the darwin stdenv lacks.
-              ++ lib.optionals (needsBuild && platform.isDarwin) [
-                pkgs.cctools
-                pkgs.xcbuild
-              ];
-            }
-            // (
-              if needsBuild then
-                {
-                  npm_config_nodedir = nodejs;
-                  nodeGyp = "${nodejs}/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js";
-                }
-              else
-                {
-                  preferLocalBuild = true;
-                  allowSubstitutes = false;
-                }
-            )
-          )
-          ''
+              "hinata-cycle-${first.name}-${first.version}"
+          );
+          script = ''
             source ${helpers}
             ${lib.concatMapStrings installMember members}
             ${lib.concatMapStrings buildMember members}
           '';
+        in
+        if needsBuild then
+          pkgs.runCommandCC name {
+            nativeBuildInputs = [
+              pkgs.jq
+              nodejs
+              pkgs.python3
+            ]
+            # node-gyp on darwin needs libtool and xcrun, which the darwin stdenv lacks.
+            ++ lib.optionals platform.isDarwin [
+              pkgs.cctools
+              pkgs.xcbuild
+            ];
+            npm_config_nodedir = nodejs;
+            nodeGyp = "${nodejs}/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js";
+          } script
+        else
+          # Sourcing the stdenv setup costs more than unpacking and linking most packages.
+          derivation {
+            inherit name script;
+            system = pkgs.stdenv.buildPlatform.system;
+            builder = pkgs.stdenv.shell;
+            args = [
+              "-euo"
+              "pipefail"
+              "-c"
+              ''source "$scriptPath"''
+            ];
+            passAsFile = [ "script" ];
+            PATH = lib.makeBinPath [
+              pkgs.coreutils
+              pkgs.gnutar
+              pkgs.gzip
+              pkgs.jq
+            ];
+            preferLocalBuild = true;
+            allowSubstitutes = false;
+          };
 
       groups = lib.mapAttrs mkGroup (lib.groupBy groupOf (lib.attrNames packages));
 

@@ -18,9 +18,9 @@ owo-colors = "4"
 petgraph = "0.8"
 reqwest = { version = "0.13", features = ["json", "gzip", "brotli", "zstd"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 serde_yaml = "0.9"
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 
