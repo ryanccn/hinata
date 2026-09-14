@@ -13,6 +13,7 @@ use serde_json::ser::PrettyFormatter;
 use serde_json::{Map, Value};
 
 use crate::lock::Specifiers;
+use crate::resolve::Project;
 
 #[derive(Deserialize)]
 pub struct Manifest {
@@ -68,10 +69,39 @@ pub enum BuildMode {
 #[serde(rename_all = "camelCase")]
 struct PnpmWorkspace {
     #[serde(default)]
+    packages: Vec<String>,
+    #[serde(default)]
     allow_builds: BTreeMap<String, bool>,
 }
 
 impl Manifest {
+    pub fn project(&self) -> Project {
+        Project {
+            name: self.name.clone(),
+            version: self.version.clone(),
+            specifiers: self.specifiers.clone(),
+        }
+    }
+
+    /// Directories matched by `packages` in `pnpm-workspace.yaml`, as `/`-separated paths relative
+    /// to `root`.
+    pub fn workspace_packages(&self, root: &Path) -> Result<BTreeSet<String>> {
+        let mut include = Vec::new();
+        let mut exclude = Vec::new();
+        for pattern in &self.workspace.packages {
+            match pattern.strip_prefix('!') {
+                Some(excluded) => exclude.push(pattern_segments(excluded)),
+                None => include.push(pattern_segments(pattern)),
+            }
+        }
+
+        let mut found = BTreeSet::new();
+        if !include.is_empty() {
+            find_packages(root, &mut Vec::new(), &include, &exclude, &mut found)?;
+        }
+        Ok(found)
+    }
+
     pub fn allow_builds(&self) -> BTreeMap<String, BuildMode> {
         let mut builds: BTreeMap<String, BuildMode> = self
             .workspace
@@ -108,6 +138,79 @@ impl Manifest {
     }
 }
 
+fn pattern_segments(pattern: &str) -> Vec<&str> {
+    pattern
+        .trim()
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect()
+}
+
+fn find_packages(
+    root: &Path,
+    path: &mut Vec<String>,
+    include: &[Vec<&str>],
+    exclude: &[Vec<&str>],
+    found: &mut BTreeSet<String>,
+) -> Result<()> {
+    let dir = root.join(path.join("/"));
+    let entries = fs::read_dir(&dir).wrap_err_with(|| format!("reading {}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.wrap_err_with(|| format!("reading {}", dir.display()))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "node_modules" || name.starts_with('.') || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        path.push(name);
+        let segments: Vec<&str> = path.iter().map(String::as_str).collect();
+        let descend = any_matches(include, &segments, true);
+        let matched = descend
+            && any_matches(include, &segments, false)
+            && !any_matches(exclude, &segments, false);
+        if matched && entry.path().join("package.json").is_file() {
+            found.insert(path.join("/"));
+        }
+        if descend {
+            find_packages(root, path, include, exclude, found)?;
+        }
+        path.pop();
+    }
+    Ok(())
+}
+
+fn any_matches(patterns: &[Vec<&str>], path: &[&str], prefix: bool) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| matches_path(pattern, path, prefix))
+}
+
+/// With `prefix`, also matches paths that a longer path below them could match.
+fn matches_path(pattern: &[&str], path: &[&str], prefix: bool) -> bool {
+    match (pattern.split_first(), path.split_first()) {
+        (Some((&"**", rest)), _) => {
+            matches_path(rest, path, prefix)
+                || path
+                    .split_first()
+                    .is_some_and(|(_, below)| matches_path(pattern, below, prefix))
+        }
+        (Some((segment, rest)), Some((name, below))) => {
+            matches_segment(segment.as_bytes(), name.as_bytes())
+                && matches_path(rest, below, prefix)
+        }
+        (Some(_), None) => prefix,
+        (None, rest) => rest.is_none(),
+    }
+}
+
+fn matches_segment(pattern: &[u8], name: &[u8]) -> bool {
+    match pattern.split_first() {
+        None => name.is_empty(),
+        Some((b'*', rest)) => (0..=name.len()).any(|at| matches_segment(rest, &name[at..])),
+        Some((b'?', rest)) => !name.is_empty() && matches_segment(rest, &name[1..]),
+        Some((byte, rest)) => name.first() == Some(byte) && matches_segment(rest, &name[1..]),
+    }
+}
+
 pub fn read(dir: &Path) -> Result<Manifest> {
     let path = dir.join("package.json");
     let source =
@@ -116,15 +219,21 @@ pub fn read(dir: &Path) -> Result<Manifest> {
         serde_json::from_str(&source).wrap_err_with(|| format!("parsing {}", path.display()))?;
 
     let path = dir.join("pnpm-workspace.yaml");
-    match fs::read_to_string(&path) {
-        Ok(source) => {
-            manifest.workspace = serde_yaml::from_str(&source)
-                .wrap_err_with(|| format!("parsing {}", path.display()))?;
-        }
-        Err(error) if error.kind() == ErrorKind::NotFound => {}
-        Err(error) => return Err(error).wrap_err_with(|| format!("reading {}", path.display())),
+    if let Some(source) =
+        read_if_exists(&path).wrap_err_with(|| format!("reading {}", path.display()))?
+    {
+        manifest.workspace = serde_yaml::from_str(&source)
+            .wrap_err_with(|| format!("parsing {}", path.display()))?;
     }
     Ok(manifest)
+}
+
+pub fn read_if_exists(path: &Path) -> std::io::Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(source) => Ok(Some(source)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -312,5 +421,50 @@ mod tests {
         )
         .unwrap();
         assert!(read(dir.path()).is_err());
+    }
+
+    #[test]
+    fn finds_workspace_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        for path in [
+            ".",
+            "packages/a",
+            "packages/b",
+            "packages/a/node_modules/x",
+            "packages/.hidden",
+            "tools/deep/nested",
+            "other",
+        ] {
+            fs::create_dir_all(dir.path().join(path)).unwrap();
+            fs::write(dir.path().join(path).join("package.json"), "{}").unwrap();
+        }
+        fs::create_dir_all(dir.path().join("packages/no-manifest")).unwrap();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\n  - ./tools/**\n  - '!packages/b'\n",
+        )
+        .unwrap();
+
+        let manifest = read(dir.path()).unwrap();
+        assert_eq!(
+            manifest.workspace_packages(dir.path()).unwrap(),
+            BTreeSet::from(["packages/a".to_string(), "tools/deep/nested".to_string()])
+        );
+    }
+
+    #[test]
+    fn matches_glob_patterns() {
+        assert!(matches_segment(b"*", b"anything"));
+        assert!(matches_segment(b"app-?", b"app-1"));
+        assert!(!matches_segment(b"app-*", b"lib-1"));
+        assert!(matches_path(&["a", "**", "c"], &["a", "c"], false));
+        assert!(matches_path(
+            &["a", "**", "c"],
+            &["a", "b", "b", "c"],
+            false
+        ));
+        assert!(!matches_path(&["a", "*"], &["a"], false));
+        assert!(matches_path(&["a", "*"], &["a"], true));
+        assert!(!matches_path(&["a", "*"], &["a", "b", "c"], true));
     }
 }

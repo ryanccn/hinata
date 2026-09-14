@@ -74,9 +74,23 @@ pub struct Specifiers {
 
 impl Specifiers {
     pub fn is_empty(&self) -> bool {
-        self.dependencies.is_empty()
-            && self.dev_dependencies.is_empty()
-            && self.optional_dependencies.is_empty()
+        self.groups().into_iter().all(BTreeMap::is_empty)
+    }
+
+    pub fn groups(&self) -> [&BTreeMap<String, String>; 3] {
+        [
+            &self.dependencies,
+            &self.dev_dependencies,
+            &self.optional_dependencies,
+        ]
+    }
+
+    pub fn groups_mut(&mut self) -> [&mut BTreeMap<String, String>; 3] {
+        [
+            &mut self.dependencies,
+            &mut self.dev_dependencies,
+            &mut self.optional_dependencies,
+        ]
     }
 }
 

@@ -18,28 +18,140 @@ use crate::lock::{self, Lock, Specifiers};
 use crate::logging::{LogDisplay as _, plural};
 use crate::registry::{Packument, Registry, VersionManifest};
 
+const WORKSPACE: &str = "workspace:";
+
+pub struct Project {
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub specifiers: Specifiers,
+}
+
+type Groups = [BTreeMap<String, String>; 3];
+
+type Workspace<'p> = HashMap<&'p str, (&'p str, &'p Project)>;
+
+/// Projects are keyed by their `/`-separated path relative to the workspace root, which is `.`.
 pub fn resolve(
-    specifiers: &Specifiers,
+    projects: &BTreeMap<String, Project>,
     registry: &dyn Registry,
     preferred: &[(String, String)],
 ) -> Result<Lock> {
-    let mut chooser = Chooser {
-        registry,
-        packuments: HashMap::new(),
-        chosen: HashMap::new(),
-        nodes: BTreeMap::new(),
-    };
-    for (name, version) in preferred {
-        if let Ok(version) = Version::parse(version) {
-            chooser
-                .chosen
-                .entry(name.clone())
-                .or_default()
-                .insert(version);
+    let workspace = workspace_names(projects)?;
+    let mut registry_specifiers = Vec::new();
+    let mut links = Vec::new();
+    for (path, project) in projects {
+        let (specifiers, project_links) =
+            split_workspace_links(&workspace, path, &project.specifiers)
+                .wrap_err_with(|| format!("in {path}"))?;
+        registry_specifiers.push(specifiers);
+        links.push(project_links);
+    }
+
+    let mut chooser = Chooser::new(registry, preferred);
+    let groups = chooser.choose_all(&registry_specifiers)?;
+    let (packages, root_ids) = build_packages(&chooser.nodes, &groups)?;
+    let importers = projects
+        .iter()
+        .zip(links)
+        .zip(root_ids)
+        .map(|(((path, project), links), ids)| {
+            let [dependencies, dev_dependencies, optional_dependencies] = ids;
+            let importer = lock::Importer {
+                dependencies,
+                dev_dependencies,
+                optional_dependencies,
+                links,
+                specifiers: project.specifiers.clone(),
+            };
+            (path.clone(), importer)
+        })
+        .collect();
+    Ok(Lock {
+        version: lock::VERSION,
+        sccs: lock::find_cycles(&packages),
+        packages,
+        importers,
+    })
+}
+
+fn workspace_names(projects: &BTreeMap<String, Project>) -> Result<Workspace<'_>> {
+    let mut workspace = Workspace::new();
+    for (path, project) in projects {
+        if let Some(name) = &project.name
+            && let Some((other, _)) = workspace.insert(name.as_str(), (path.as_str(), project))
+        {
+            bail!("{other} and {path} are both named {name}");
         }
     }
-    let importer = chooser.choose_all(specifiers)?;
-    build_lock(&chooser.nodes, &importer, specifiers)
+    Ok(workspace)
+}
+
+fn split_workspace_links(
+    workspace: &Workspace<'_>,
+    from: &str,
+    specifiers: &Specifiers,
+) -> Result<(Specifiers, BTreeMap<String, String>)> {
+    let mut registry_specifiers = Specifiers::default();
+    let mut links = BTreeMap::new();
+    let groups = specifiers
+        .groups()
+        .into_iter()
+        .zip(registry_specifiers.groups_mut());
+    for (deps, registry_deps) in groups {
+        for (alias, spec) in deps {
+            match spec.strip_prefix(WORKSPACE) {
+                Some(spec) => {
+                    links.insert(alias.clone(), workspace_link(workspace, from, alias, spec)?);
+                }
+                None => {
+                    registry_deps.insert(alias.clone(), spec.clone());
+                }
+            }
+        }
+    }
+    Ok((registry_specifiers, links))
+}
+
+fn workspace_link(
+    workspace: &Workspace<'_>,
+    from: &str,
+    alias: &str,
+    spec: &str,
+) -> Result<String> {
+    let (name, range) = split_version(spec).unwrap_or((alias, spec));
+    let (to, project) = workspace
+        .get(name)
+        .ok_or_else(|| eyre!("{alias}: no workspace package is named {name}"))?;
+    if !matches!(range, "" | "*" | "^" | "~") {
+        let parsed = Range::parse(range)
+            .map_err(|error| eyre!("{alias}: {range} is not a valid range: {error}"))?;
+        let version = project
+            .version
+            .as_deref()
+            .and_then(|version| Version::parse(version).ok());
+        if !version.is_some_and(|version| parsed.satisfies(&version)) {
+            bail!("{alias}: the workspace package {name} in {to} does not match {range}");
+        }
+    }
+    Ok(relative_path(from, to))
+}
+
+fn relative_path(from: &str, to: &str) -> String {
+    fn components(path: &str) -> Vec<&str> {
+        path.split('/')
+            .filter(|component| !component.is_empty() && *component != ".")
+            .collect()
+    }
+    let (from, to) = (components(from), components(to));
+    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    let parts: Vec<&str> = std::iter::repeat_n("..", from.len() - common)
+        .chain(to[common..].iter().copied())
+        .collect();
+    if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    }
 }
 
 struct Node {
@@ -89,7 +201,7 @@ enum Edge {
 }
 
 enum Origin {
-    Importer(usize),
+    Importer { index: usize, group: usize },
     Node(String),
 }
 
@@ -127,21 +239,35 @@ struct Chooser<'r> {
     nodes: BTreeMap<String, Node>,
 }
 
-impl Chooser<'_> {
-    fn choose_all(&mut self, specifiers: &Specifiers) -> Result<[BTreeMap<String, String>; 3]> {
-        let groups = [
-            (&specifiers.dependencies, Edge::Dependency),
-            (&specifiers.dev_dependencies, Edge::Dependency),
-            (&specifiers.optional_dependencies, Edge::Optional),
-        ];
+impl<'r> Chooser<'r> {
+    fn new(registry: &'r dyn Registry, preferred: &[(String, String)]) -> Self {
+        let mut chosen: HashMap<String, BTreeSet<Version>> = HashMap::new();
+        for (name, version) in preferred {
+            if let Ok(version) = Version::parse(version) {
+                chosen.entry(name.clone()).or_default().insert(version);
+            }
+        }
+        Chooser {
+            registry,
+            packuments: HashMap::new(),
+            chosen,
+            nodes: BTreeMap::new(),
+        }
+    }
+
+    fn choose_all(&mut self, importers: &[Specifiers]) -> Result<Vec<Groups>> {
+        let edges = [Edge::Dependency, Edge::Dependency, Edge::Optional];
         let mut requests = Vec::new();
-        for (group, (deps, edge)) in groups.into_iter().enumerate() {
-            for (alias, spec) in deps {
-                requests.extend(Request::new(Origin::Importer(group), edge, alias, spec)?);
+        for (index, specifiers) in importers.iter().enumerate() {
+            for (group, (deps, edge)) in specifiers.groups().into_iter().zip(edges).enumerate() {
+                for (alias, spec) in deps {
+                    let from = Origin::Importer { index, group };
+                    requests.extend(Request::new(from, edge, alias, spec)?);
+                }
             }
         }
 
-        let mut importer: [BTreeMap<String, String>; 3] = Default::default();
+        let mut groups: Vec<Groups> = importers.iter().map(|_| Groups::default()).collect();
         while !requests.is_empty() {
             self.fetch(&requests)?;
             let mut added = Vec::new();
@@ -154,8 +280,8 @@ impl Chooser<'_> {
                     added.push(key.clone());
                 }
                 match request.from {
-                    Origin::Importer(group) => {
-                        importer[group].insert(request.alias, key);
+                    Origin::Importer { index, group } => {
+                        groups[index][group].insert(request.alias, key);
                     }
                     Origin::Node(from) => {
                         let node = self
@@ -179,7 +305,7 @@ impl Chooser<'_> {
                 .flatten()
                 .collect();
         }
-        Ok(importer)
+        Ok(groups)
     }
 
     fn fetch(&mut self, requests: &[Request]) -> Result<()> {
@@ -308,10 +434,7 @@ impl Chooser<'_> {
 
 pub(crate) fn parse_spec(alias: &str, spec: &str) -> Result<(String, String)> {
     let (name, range) = match spec.strip_prefix("npm:") {
-        Some(target) => match target.get(1..).and_then(|rest| rest.find('@')) {
-            Some(at) => (&target[..=at], &target[at + 2..]),
-            None => (target, ""),
-        },
+        Some(target) => split_version(target).unwrap_or((target, "")),
         None => (alias, spec),
     };
     let range = range.trim();
@@ -320,6 +443,12 @@ pub(crate) fn parse_spec(alias: &str, spec: &str) -> Result<(String, String)> {
     }
     let range = if range.is_empty() { "*" } else { range };
     Ok((name.to_string(), range.to_string()))
+}
+
+/// Splits `name@version`, where `name` may be scoped.
+pub(crate) fn split_version(spec: &str) -> Option<(&str, &str)> {
+    let at = spec.get(1..)?.find('@')? + 1;
+    Some((&spec[..at], &spec[at + 1..]))
 }
 
 fn unique_names<'a>(requests: impl Iterator<Item = &'a Request>) -> Vec<String> {
@@ -362,33 +491,31 @@ fn pick_version(
     }
 
     let range = Range::parse(range).ok()?;
-    let reused = chosen
+    let latest = || {
+        fetched
+            .packument
+            .dist_tags
+            .get("latest")
+            .and_then(|latest| Version::parse(latest).ok())
+            .filter(|latest| range.satisfies(latest))
+            .and_then(|latest| available(&latest))
+    };
+    let highest = || {
+        fetched
+            .versions
+            .iter()
+            .rev()
+            .find(|(version, _)| range.satisfies(version))
+            .map(|(version, raw)| (version.clone(), raw.clone()))
+    };
+    chosen
         .into_iter()
         .flatten()
         .rev()
         .filter(|version| range.satisfies(version))
-        .find_map(available);
-    if reused.is_some() {
-        return reused;
-    }
-
-    let latest = fetched
-        .packument
-        .dist_tags
-        .get("latest")
-        .and_then(|latest| Version::parse(latest).ok())
-        .filter(|latest| range.satisfies(latest))
-        .and_then(|latest| available(&latest));
-    if latest.is_some() {
-        return latest;
-    }
-
-    fetched
-        .versions
-        .iter()
-        .rev()
-        .find(|(version, _)| range.satisfies(version))
-        .map(|(version, raw)| (version.clone(), raw.clone()))
+        .find_map(available)
+        .or_else(latest)
+        .or_else(highest)
 }
 
 /// Peer names a node's subtree may resolve from outside it. Over-approximating only reduces sharing.
@@ -491,6 +618,7 @@ struct PeerResolver<'n> {
     closures: HashMap<String, BTreeSet<String>>,
     fallbacks: HashMap<String, String>,
     frames: Vec<Frame>,
+    root_frame: usize,
     memo: HashMap<MemoKey, Instance>,
     in_progress: HashSet<MemoKey>,
     visiting: HashSet<(String, usize)>,
@@ -505,6 +633,26 @@ impl PeerResolver<'_> {
             }
             frame = self.frames[frame].parent?;
         }
+    }
+
+    fn instantiate_root(&mut self, groups: &Groups) -> Result<Groups> {
+        // Regular dependencies take precedence over dev and optional ones.
+        let mut names = BTreeMap::new();
+        for group in [1, 2, 0] {
+            names.extend(groups[group].clone());
+        }
+        self.frames.push(Frame {
+            names,
+            parent: None,
+        });
+        self.root_frame = self.frames.len() - 1;
+        let mut ids = Groups::default();
+        for (group, deps) in groups.iter().enumerate() {
+            for (alias, key) in deps {
+                ids[group].insert(alias.clone(), self.instantiate(key, self.root_frame)?.id);
+            }
+        }
+        Ok(ids)
     }
 
     fn instantiate(&mut self, key: &str, frame: usize) -> Result<Instance> {
@@ -524,6 +672,7 @@ impl PeerResolver<'_> {
 
         let mut visible = BTreeMap::new();
         let mut fell_back = BTreeSet::new();
+        let root_frame = self.root_frame;
         for name in &closure {
             let found = self.lookup(frame, name).or_else(|| {
                 let fallback = self
@@ -531,7 +680,7 @@ impl PeerResolver<'_> {
                     .get(name)
                     .filter(|fallback| fallback.as_str() != key)?;
                 fell_back.insert(name.clone());
-                Some((fallback.clone(), 0))
+                Some((fallback.clone(), root_frame))
             });
             if let Some((peer_key, peer_frame)) = found {
                 visible.insert(name.clone(), self.instantiate(&peer_key, peer_frame)?.id);
@@ -618,37 +767,26 @@ impl PeerResolver<'_> {
     }
 }
 
-fn build_lock(
+fn build_packages(
     nodes: &BTreeMap<String, Node>,
-    importer: &[BTreeMap<String, String>; 3],
-    specifiers: &Specifiers,
-) -> Result<Lock> {
+    roots: &[Groups],
+) -> Result<(BTreeMap<String, lock::Package>, Vec<Groups>)> {
     let mut resolver = PeerResolver {
         nodes,
         closures: peer_closures(nodes),
         fallbacks: optional_peer_fallbacks(nodes),
         frames: Vec::new(),
+        root_frame: 0,
         memo: HashMap::new(),
         in_progress: HashSet::new(),
         visiting: HashSet::new(),
         instances: BTreeMap::new(),
     };
 
-    // Regular dependencies take precedence over dev and optional ones.
-    let mut names = BTreeMap::new();
-    for group in [1, 2, 0] {
-        names.extend(importer[group].clone());
-    }
-    resolver.frames.push(Frame {
-        names,
-        parent: None,
-    });
-    let mut ids: [BTreeMap<String, String>; 3] = Default::default();
-    for (group, deps) in importer.iter().enumerate() {
-        for (alias, key) in deps {
-            ids[group].insert(alias.clone(), resolver.instantiate(key, 0)?.id);
-        }
-    }
+    let mut root_ids = roots
+        .iter()
+        .map(|groups| resolver.instantiate_root(groups))
+        .collect::<Result<Vec<_>>>()?;
 
     // Instances still being computed within a cycle are referenced by their node key.
     let known: HashSet<String> = resolver.instances.keys().cloned().collect();
@@ -665,6 +803,9 @@ fn build_lock(
             *id = real.clone();
         }
     };
+    for deps in root_ids.iter_mut().flatten() {
+        deps.values_mut().for_each(settle);
+    }
 
     let mut packages = BTreeMap::new();
     for (id, mut instance) in resolver.instances {
@@ -700,23 +841,7 @@ fn build_lock(
         );
     }
 
-    let [dependencies, dev_dependencies, optional_dependencies] = ids.map(|mut deps| {
-        deps.values_mut().for_each(settle);
-        deps
-    });
-    let root = lock::Importer {
-        dependencies,
-        dev_dependencies,
-        optional_dependencies,
-        links: BTreeMap::new(),
-        specifiers: specifiers.clone(),
-    };
-    Ok(Lock {
-        version: lock::VERSION,
-        sccs: lock::find_cycles(&packages),
-        packages,
-        importers: BTreeMap::from([(".".to_string(), root)]),
-    })
+    Ok((packages, root_ids))
 }
 
 #[cfg(test)]
@@ -779,6 +904,23 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    fn resolve(
+        specifiers: &Specifiers,
+        registry: &dyn Registry,
+        preferred: &[(String, String)],
+    ) -> Result<Lock> {
+        let project = Project {
+            name: None,
+            version: None,
+            specifiers: specifiers.clone(),
+        };
+        super::resolve(
+            &BTreeMap::from([(".".to_string(), project)]),
+            registry,
+            preferred,
+        )
     }
 
     fn deps(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -1082,6 +1224,95 @@ mod tests {
             lock.sccs,
             vec![vec!["a@1.0.0".to_string(), "b@1.0.0".to_string()]]
         );
+    }
+
+    fn project(name: &str, version: &str, dependencies: &[(&str, &str)]) -> Project {
+        Project {
+            name: Some(name.to_string()),
+            version: Some(version.to_string()),
+            specifiers: specifiers(dependencies),
+        }
+    }
+
+    #[test]
+    fn resolves_workspace_importers_and_links() {
+        let projects = BTreeMap::from([
+            (
+                ".".to_string(),
+                project(
+                    "root",
+                    "0.0.0",
+                    &[("react", "^18"), ("hooks", "^1"), ("shared", "workspace:^")],
+                ),
+            ),
+            (
+                "apps/legacy".to_string(),
+                project(
+                    "legacy-app",
+                    "1.0.0",
+                    &[
+                        ("react", "^17"),
+                        ("hooks", "^1"),
+                        ("common", "workspace:shared@^1.2.0"),
+                    ],
+                ),
+            ),
+            (
+                "packages/shared".to_string(),
+                project("shared", "1.2.3", &[("react-dom", "^18")]),
+            ),
+        ]);
+        let lock = super::resolve(&projects, &react_registry(), &[]).unwrap();
+
+        let root = &lock.importers["."];
+        assert_eq!(root.dependencies["hooks"], "hooks@1.0.0(react@18.3.1)");
+        assert_eq!(root.links["shared"], "packages/shared");
+        assert!(!root.dependencies.contains_key("shared"));
+        assert_eq!(root.specifiers.dependencies["shared"], "workspace:^");
+
+        let legacy = &lock.importers["apps/legacy"];
+        assert_eq!(legacy.dependencies["react"], "react@17.0.2");
+        assert_eq!(legacy.dependencies["hooks"], "hooks@1.0.0(react@17.0.2)");
+        assert_eq!(legacy.links["common"], "../../packages/shared");
+
+        assert_eq!(
+            lock.importers["packages/shared"].dependencies["react-dom"],
+            "react-dom@18.3.1"
+        );
+        assert_eq!(lock.importers.len(), 3);
+    }
+
+    #[test]
+    fn rejects_mismatched_workspace_links() {
+        let registry = registry(vec![]);
+        for (spec, message) in [
+            ("workspace:^2", "does not match ^2"),
+            (
+                "workspace:missing@*",
+                "no workspace package is named missing",
+            ),
+        ] {
+            let projects = BTreeMap::from([
+                (
+                    ".".to_string(),
+                    project("root", "0.0.0", &[("shared", spec)]),
+                ),
+                (
+                    "packages/shared".to_string(),
+                    project("shared", "1.0.0", &[]),
+                ),
+            ]);
+            let error = super::resolve(&projects, &registry, &[]).unwrap_err();
+            assert!(format!("{error:?}").contains(message), "{spec}: {error:?}");
+        }
+    }
+
+    #[test]
+    fn computes_relative_paths() {
+        assert_eq!(relative_path(".", "packages/a"), "packages/a");
+        assert_eq!(relative_path("packages/a", "packages/b"), "../b");
+        assert_eq!(relative_path("apps/web", "."), "../..");
+        assert_eq!(relative_path("packages/a", "packages/a"), ".");
     }
 
     #[test]

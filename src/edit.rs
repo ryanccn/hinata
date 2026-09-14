@@ -131,10 +131,7 @@ fn parse_package_arg(arg: &str) -> Result<PackageArg> {
 }
 
 fn split_version(arg: &str) -> (&str, Option<&str>) {
-    match arg.get(1..).and_then(|rest| rest.find('@')) {
-        Some(at) => (&arg[..=at], Some(&arg[at + 2..])),
-        None => (arg, None),
-    }
+    resolve::split_version(arg).map_or((arg, None), |(name, version)| (name, Some(version)))
 }
 
 #[cfg(test)]

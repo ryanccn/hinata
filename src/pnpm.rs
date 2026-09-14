@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs;
-use std::io::ErrorKind;
 use std::path::Path;
 
 use eyre::{Result, WrapErr, bail, eyre};
@@ -15,6 +13,7 @@ use serde::Deserialize;
 use crate::lock::{self, Lock, Specifiers};
 use crate::logging::LogDisplay as _;
 use crate::registry::{DEFAULT_REGISTRY, Registry};
+use crate::{manifest, resolve};
 
 pub const LOCKFILE: &str = "pnpm-lock.yaml";
 
@@ -79,10 +78,10 @@ struct Snapshot {
 /// Leaves `install_script` unset, since pnpm lockfiles do not record it.
 pub fn read(root: &Path) -> Result<Option<Lock>> {
     let path = root.join(LOCKFILE);
-    let source = match fs::read_to_string(&path) {
-        Ok(source) => source,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).wrap_err_with(|| format!("reading {}", path.display())),
+    let Some(source) =
+        manifest::read_if_exists(&path).wrap_err_with(|| format!("reading {}", path.display()))?
+    else {
+        return Ok(None);
     };
     parse(&source)
         .map(Some)
@@ -205,23 +204,16 @@ fn convert(pnpm: PnpmLock) -> Result<Lock> {
     for (path, importer) in pnpm.importers {
         let mut result = lock::Importer::default();
         let groups = [
-            (
-                importer.dependencies,
-                &mut result.dependencies,
-                &mut result.specifiers.dependencies,
-            ),
-            (
-                importer.dev_dependencies,
-                &mut result.dev_dependencies,
-                &mut result.specifiers.dev_dependencies,
-            ),
+            (importer.dependencies, &mut result.dependencies),
+            (importer.dev_dependencies, &mut result.dev_dependencies),
             (
                 importer.optional_dependencies,
                 &mut result.optional_dependencies,
-                &mut result.specifiers.optional_dependencies,
             ),
         ];
-        for (dependencies, ids, specifiers) in groups {
+        for ((dependencies, ids), specifiers) in
+            groups.into_iter().zip(result.specifiers.groups_mut())
+        {
             for (alias, dependency) in dependencies {
                 if let Some(target) = dependency.version.strip_prefix("link:") {
                     result.links.insert(alias.clone(), target.to_string());
@@ -247,29 +239,24 @@ fn convert(pnpm: PnpmLock) -> Result<Lock> {
 }
 
 fn dep_paths(id: &str, references: BTreeMap<String, String>) -> Result<BTreeMap<String, String>> {
-    references
-        .into_iter()
-        .filter_map(|(alias, reference)| {
-            if reference.starts_with("link:") {
-                return Some(Err(eyre!(
-                    "{id} depends on {alias} through {reference}, which is not supported yet"
-                )));
-            }
-            let path = dep_path(&alias, &reference);
-            (!is_runtime(&path)).then_some(Ok((alias, path)))
-        })
-        .collect()
+    let mut paths = BTreeMap::new();
+    for (alias, reference) in references {
+        if reference.starts_with("link:") {
+            bail!("{id} depends on {alias} through {reference}, which is not supported yet");
+        }
+        let path = dep_path(&alias, &reference);
+        if !is_runtime(&path) {
+            paths.insert(alias, path);
+        }
+    }
+    Ok(paths)
 }
 
 /// Runtimes are skipped when converting, and pnpm records them even when package.json does not
 /// list them as dependencies.
 pub fn without_runtimes(specifiers: &Specifiers) -> Specifiers {
     let mut specifiers = specifiers.clone();
-    for group in [
-        &mut specifiers.dependencies,
-        &mut specifiers.dev_dependencies,
-        &mut specifiers.optional_dependencies,
-    ] {
+    for group in specifiers.groups_mut() {
         group.retain(|_, spec| !spec.starts_with(RUNTIME));
     }
     specifiers
@@ -295,9 +282,7 @@ fn dep_path(alias: &str, reference: &str) -> String {
 }
 
 fn split_key(key: &str) -> Option<(&str, &str)> {
-    let at = key.get(1..)?.find('@')? + 1;
-    let (name, version) = (&key[..at], &key[at + 1..]);
-    (!version.is_empty()).then_some((name, version))
+    resolve::split_version(key).filter(|(_, version)| !version.is_empty())
 }
 
 fn unscoped(name: &str) -> &str {

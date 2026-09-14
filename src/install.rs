@@ -17,8 +17,9 @@ use serde::Deserialize;
 
 use crate::lock::{self, Lock};
 use crate::logging::{LogDisplay as _, plural};
-use crate::manifest::BuildMode;
+use crate::manifest::{BuildMode, Manifest};
 use crate::registry::{DEFAULT_REGISTRY, HttpRegistry};
+use crate::resolve::Project;
 use crate::{impure, link, manifest, nix, pnpm, resolve};
 
 const LOCKFILE: &str = "hinata.lock";
@@ -58,7 +59,6 @@ struct ImporterRoots {
     optional_dependencies: BTreeMap<String, PathBuf>,
 }
 
-#[expect(clippy::too_many_lines)]
 pub fn run(options: &Options) -> Result<()> {
     let root = fs::canonicalize(&options.dir)
         .wrap_err_with(|| format!("opening {}", options.dir.display()))?;
@@ -76,20 +76,7 @@ pub fn run(options: &Options) -> Result<()> {
     let gcroot = gcroots.join(&name);
     let key_path = keys.join(&name);
 
-    // Native addons only load in the Node.js major version they were built for.
-    let builds = lock.packages.values().any(|package| package.build);
-    let node = builds.then(|| node_major(&root)).flatten();
-    match node {
-        Some(major) => debug!(
-            "building native addons for Node.js {}",
-            major.log_display::<Blue>()
-        ),
-        None if builds => warn!(
-            "found no working {} on PATH, so native addons will be built for nixpkgs' default Node.js",
-            "node".log_display::<Yellow>()
-        ),
-        None => {}
-    }
+    let node = native_addon_node(&root, &lock);
     let key = cache_key(&lock_json, options.dev, node);
 
     let (workspace, built) = match cached_workspace(&key_path, &gcroot, &key) {
@@ -113,11 +100,10 @@ pub fn run(options: &Options) -> Result<()> {
                 .dimmed()
             );
             // A key left behind would vouch for whichever workspace the GC root points to next.
-            match fs::remove_file(&key_path) {
-                Err(error) if error.kind() != ErrorKind::NotFound => {
-                    return Err(error).wrap_err_with(|| format!("removing {}", key_path.display()));
-                }
-                _ => {}
+            if let Err(error) = fs::remove_file(&key_path)
+                && error.kind() != ErrorKind::NotFound
+            {
+                return Err(error).wrap_err_with(|| format!("removing {}", key_path.display()));
             }
             let workspace = nix::build_workspace(&lock_json, options.dev, node, &gcroot)?;
             debug!(
@@ -128,31 +114,7 @@ pub fn run(options: &Options) -> Result<()> {
         }
     };
 
-    let importer_roots: BTreeMap<String, ImporterRoots> =
-        serde_json::from_str(&fs::read_to_string(workspace.join("importers.json"))?)?;
-    for (path, importer) in &lock.importers {
-        let dir = root.join(path);
-        let roots = importer_roots
-            .get(path)
-            .ok_or_else(|| eyre!("the Nix build has no packages for importer {path}"))?;
-        let mut packages = roots.optional_dependencies.clone();
-        packages.extend(roots.dev_dependencies.clone());
-        packages.extend(roots.dependencies.clone());
-        packages.extend(
-            importer
-                .links
-                .iter()
-                .map(|(alias, target)| (alias.clone(), dir.join(target))),
-        );
-        let node_modules = dir.join("node_modules");
-        debug!(
-            "linking {} into {}",
-            plural(packages.len(), "direct dependency", "direct dependencies"),
-            node_modules.display().log_display::<Blue>()
-        );
-        link::sync(&node_modules, &packages)
-            .wrap_err_with(|| format!("linking {}", node_modules.display()))?;
-    }
+    link_importers(&root, &lock, &workspace)?;
 
     if built {
         let impure_builds: BTreeMap<String, PathBuf> =
@@ -180,44 +142,85 @@ pub fn run(options: &Options) -> Result<()> {
     Ok(())
 }
 
-#[expect(clippy::too_many_lines)]
+fn native_addon_node(root: &Path, lock: &Lock) -> Option<u32> {
+    if !lock.packages.values().any(|package| package.build) {
+        return None;
+    }
+    // Native addons only load in the Node.js major version they were built for.
+    let node = node_major(root);
+    match node {
+        Some(major) => debug!(
+            "building native addons for Node.js {}",
+            major.log_display::<Blue>()
+        ),
+        None => warn!(
+            "found no working {} on PATH, so native addons will be built for nixpkgs' default Node.js",
+            "node".log_display::<Yellow>()
+        ),
+    }
+    node
+}
+
+fn link_importers(root: &Path, lock: &Lock, workspace: &Path) -> Result<()> {
+    let importer_roots: BTreeMap<String, ImporterRoots> =
+        serde_json::from_str(&fs::read_to_string(workspace.join("importers.json"))?)?;
+    for (path, importer) in &lock.importers {
+        let dir = root.join(path);
+        let roots = importer_roots
+            .get(path)
+            .ok_or_else(|| eyre!("the Nix build has no packages for importer {path}"))?;
+        let mut packages = roots.optional_dependencies.clone();
+        packages.extend(roots.dev_dependencies.clone());
+        packages.extend(roots.dependencies.clone());
+        packages.extend(
+            importer
+                .links
+                .iter()
+                .map(|(alias, target)| (alias.clone(), dir.join(target))),
+        );
+        let node_modules = dir.join("node_modules");
+        debug!(
+            "linking {} into {}",
+            plural(packages.len(), "direct dependency", "direct dependencies"),
+            node_modules.display().log_display::<Blue>()
+        );
+        link::sync(&node_modules, &packages)
+            .wrap_err_with(|| format!("linking {}", node_modules.display()))?;
+    }
+    Ok(())
+}
+
 fn update_lock(
     root: &Path,
     lock_path: &Path,
     options: &Options,
 ) -> Result<(Lock, String, &'static str)> {
     let manifest = manifest::read(root)?;
-    let existing = match fs::read_to_string(lock_path) {
-        Ok(json) => Some(serde_json::from_str::<Lock>(&json).wrap_err("parsing hinata.lock")?),
-        Err(error) if error.kind() == ErrorKind::NotFound => None,
-        Err(error) => return Err(error).wrap_err("reading hinata.lock"),
-    };
+    let projects = read_projects(root, &manifest)?;
+    let existing = manifest::read_if_exists(lock_path)
+        .wrap_err("reading hinata.lock")?
+        .map(|json| serde_json::from_str::<Lock>(&json))
+        .transpose()
+        .wrap_err("parsing hinata.lock")?;
     let pnpm_lock = match existing {
         Some(_) => None,
         None => pnpm::read(root)?,
     };
     let from_pnpm = pnpm_lock.is_some();
-
-    if let (Update::Only(names), Some(lock)) =
-        (&options.update, existing.as_ref().or(pnpm_lock.as_ref()))
+    if let Update::Only(names) = &options.update
+        && let Some(lock) = existing.as_ref().or(pnpm_lock.as_ref())
     {
-        for name in names {
-            if !lock.packages.values().any(|package| &package.name == name) {
-                warn!(
-                    "{} is not installed, so there is nothing to update",
-                    name.log_display::<Yellow>()
-                );
-            }
-        }
+        warn_missing_updates(names, lock);
     }
 
-    let specifiers = pnpm::without_runtimes(&manifest.specifiers);
     let current = |lock: &Lock| {
         lock.version == lock::VERSION
-            && lock
-                .importers
-                .get(".")
-                .is_some_and(|root| root.specifiers == specifiers)
+            && lock.importers.len() == projects.len()
+            && projects.iter().all(|(path, project)| {
+                lock.importers.get(path).is_some_and(|importer| {
+                    importer.specifiers == pnpm::without_runtimes(&project.specifiers)
+                })
+            })
     };
     let keep = matches!(options.update, Update::Keep);
     let (mut lock, pnpm_only) = match (existing, pnpm_lock) {
@@ -265,7 +268,7 @@ fn update_lock(
                 })
                 .unwrap_or_default();
             let registry = HttpRegistry::new(DEFAULT_REGISTRY)?;
-            let lock = resolve::resolve(&manifest.specifiers, &registry, &preferred)?;
+            let lock = resolve::resolve(&projects, &registry, &preferred)?;
             info!(
                 "resolved {}",
                 plural(lock.packages.len(), "package", "packages")
@@ -274,7 +277,36 @@ fn update_lock(
         }
     };
 
-    let allow_builds = manifest.allow_builds();
+    mark_builds(&mut lock, &manifest.allow_builds(), pnpm_only);
+    let json = lock::to_json(&lock)?;
+    if pnpm_only {
+        return Ok((lock, json, pnpm::LOCKFILE));
+    }
+    write_lock(lock_path, &json, from_pnpm)?;
+    Ok((lock, json, LOCKFILE))
+}
+
+fn read_projects(root: &Path, manifest: &Manifest) -> Result<BTreeMap<String, Project>> {
+    let mut projects = BTreeMap::from([(".".to_string(), manifest.project())]);
+    for path in manifest.workspace_packages(root)? {
+        let project = manifest::read(&root.join(&path))?.project();
+        projects.insert(path, project);
+    }
+    Ok(projects)
+}
+
+fn warn_missing_updates(names: &BTreeSet<String>, lock: &Lock) {
+    for name in names {
+        if !lock.packages.values().any(|package| &package.name == name) {
+            warn!(
+                "{} is not installed, so there is nothing to update",
+                name.log_display::<Yellow>()
+            );
+        }
+    }
+}
+
+fn mark_builds(lock: &mut Lock, allow_builds: &BTreeMap<String, BuildMode>, pnpm_only: bool) {
     let mut skipped = BTreeSet::new();
     for package in lock.packages.values_mut() {
         // pnpm lockfiles do not record which packages have install scripts.
@@ -287,44 +319,44 @@ fn update_lock(
             skipped.insert(package.name.clone());
         }
     }
-    if !skipped.is_empty() {
-        let names: Vec<_> = skipped
-            .iter()
-            .map(|name| name.log_display::<Yellow>().to_string())
-            .collect();
-        warn!(
-            "skipped install scripts of {}; add them to {} in package.json to run them",
-            names.join(", "),
-            "hinata.allowBuilds".log_display::<Blue>()
-        );
+    if skipped.is_empty() {
+        return;
     }
+    let names: Vec<_> = skipped
+        .iter()
+        .map(|name| name.log_display::<Yellow>().to_string())
+        .collect();
+    warn!(
+        "skipped install scripts of {}; add them to {} in package.json to run them",
+        names.join(", "),
+        "hinata.allowBuilds".log_display::<Blue>()
+    );
+}
 
-    let json = lock::to_json(&lock)?;
-    if pnpm_only {
-        return Ok((lock, json, pnpm::LOCKFILE));
-    }
+fn write_lock(lock_path: &Path, json: &str, from_pnpm: bool) -> Result<()> {
     let previous = fs::read_to_string(lock_path).ok();
-    if previous.as_deref() != Some(json.as_str()) {
-        fs::write(lock_path, &json).wrap_err("writing hinata.lock")?;
-        info!(
-            "{} {}{}",
-            if previous.is_some() {
-                "updated"
-            } else {
-                "created"
-            },
-            LOCKFILE.log_display::<Blue>(),
-            if from_pnpm {
-                format!(
-                    ", which takes precedence over {} from now on",
-                    pnpm::LOCKFILE.log_display::<Blue>()
-                )
-            } else {
-                String::new()
-            }
-        );
+    if previous.as_deref() == Some(json) {
+        return Ok(());
     }
-    Ok((lock, json, LOCKFILE))
+    fs::write(lock_path, json).wrap_err("writing hinata.lock")?;
+    info!(
+        "{} {}{}",
+        if previous.is_some() {
+            "updated"
+        } else {
+            "created"
+        },
+        LOCKFILE.log_display::<Blue>(),
+        if from_pnpm {
+            format!(
+                ", which takes precedence over {} from now on",
+                pnpm::LOCKFILE.log_display::<Blue>()
+            )
+        } else {
+            String::new()
+        }
+    );
+    Ok(())
 }
 
 /// `DefaultHasher` output is only stable within one build of hinata.
@@ -458,6 +490,74 @@ snapshots:
         let error = update_lock(dir.path(), &lock_path, &options).unwrap_err();
         assert!(error.to_string().contains("pnpm install"));
         assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn checks_every_workspace_importer_against_the_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{ "devDependencies": { "shared": "workspace:*" } }"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\n",
+        )
+        .unwrap();
+        let shared = dir.path().join("packages/shared");
+        fs::create_dir_all(&shared).unwrap();
+        fs::write(
+            shared.join("package.json"),
+            r#"{ "name": "shared", "dependencies": { "a": "^1.0.0" } }"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(pnpm::LOCKFILE),
+            "lockfileVersion: '9.0'
+importers:
+  .:
+    devDependencies:
+      shared:
+        specifier: workspace:*
+        version: link:packages/shared
+  packages/shared:
+    dependencies:
+      a:
+        specifier: ^1.0.0
+        version: 1.0.0
+packages:
+  a@1.0.0:
+    resolution: {integrity: sha512-a}
+snapshots:
+  a@1.0.0: {}
+",
+        )
+        .unwrap();
+        let options = Options {
+            dir: dir.path().to_path_buf(),
+            dev: true,
+            refresh: false,
+            update: Update::Keep,
+            save_lock: false,
+        };
+        let lock_path = dir.path().join(LOCKFILE);
+
+        let (lock, _, file) = update_lock(dir.path(), &lock_path, &options).unwrap();
+        assert_eq!(file, pnpm::LOCKFILE);
+        assert_eq!(lock.importers.len(), 2);
+
+        fs::write(
+            shared.join("package.json"),
+            r#"{ "name": "shared", "dependencies": { "a": "^2.0.0" } }"#,
+        )
+        .unwrap();
+        let error = update_lock(dir.path(), &lock_path, &options).unwrap_err();
+        assert!(error.to_string().contains("pnpm install"));
+
+        fs::remove_file(shared.join("package.json")).unwrap();
+        let error = update_lock(dir.path(), &lock_path, &options).unwrap_err();
+        assert!(error.to_string().contains("pnpm install"));
     }
 
     #[test]
