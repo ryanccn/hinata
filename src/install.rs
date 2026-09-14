@@ -466,16 +466,19 @@ fn remove_legacy_cache(cache: &Path) {
 }
 
 /// Entries without a `path` file may belong to an install that is still setting them up.
-fn prune_projects(projects: &Path) {
+pub(crate) fn prune_projects(projects: &Path) -> usize {
     let Ok(entries) = fs::read_dir(projects) else {
-        return;
+        return 0;
     };
+
+    let mut removed = 0;
     for entry in entries.flatten() {
         let Ok(project) = fs::read(entry.path().join("path")) else {
             continue;
         };
         let project = PathBuf::from(OsString::from_vec(project));
         if !project.exists() && fs::remove_dir_all(entry.path()).is_ok() {
+            removed += 1;
             debug!(
                 "removed {} of {}, which no longer exists",
                 entry.path().display().log_display::<Blue>(),
@@ -483,6 +486,8 @@ fn prune_projects(projects: &Path) {
             );
         }
     }
+
+    removed
 }
 
 #[cfg(test)]
@@ -640,7 +645,7 @@ snapshots:
         }
         fs::create_dir_all(projects.join("pending")).unwrap();
 
-        prune_projects(&projects);
+        assert_eq!(prune_projects(&projects), 1);
         assert!(projects.join("live").exists());
         assert!(!projects.join("gone").exists());
         assert!(projects.join("pending").exists());

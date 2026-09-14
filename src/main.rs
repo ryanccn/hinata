@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 mod edit;
+mod gc;
 mod impure;
 mod install;
 mod link;
@@ -88,6 +89,8 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Remove GC roots of projects that no longer exist and clear cached registry metadata
+    Gc,
 }
 
 fn main() -> Result<()> {
@@ -137,6 +140,7 @@ fn main() -> Result<()> {
         }
         Command::Run { script, args } => exit_with(run::script(&cli.dir, &script, &args)?),
         Command::Exec { program, args } => exit_with(run::exec(&cli.dir, &program, &args)?),
+        Command::Gc => gc::run()?,
     }
     Ok(())
 }

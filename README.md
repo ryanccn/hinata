@@ -19,6 +19,7 @@ hinata remove <pkg>
 hinata update [pkg...]
 hinata run <script>
 hinata exec <command>
+hinata gc                 # remove stale GC roots and cached registry metadata
 ```
 
 Install scripts only run for packages listed in `package.json`:
