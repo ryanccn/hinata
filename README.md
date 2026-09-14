@@ -24,13 +24,24 @@ hinata exec <command>
 Install scripts only run for packages listed in `package.json`:
 
 ```json
-{ "hinata": { "allowBuilds": ["esbuild"] } }
+{
+  "hinata": {
+    "allowBuilds": ["esbuild"]
+  }
+}
 ```
 
 Install scripts run in the Nix sandbox, without network access. Scripts that download things, for example into `~/.cache`, can run after linking instead, outside the sandbox and against the read-only package:
 
 ```json
-{ "hinata": { "allowBuilds": { "esbuild": true, "puppeteer": "impure" } } }
+{
+  "hinata": {
+    "allowBuilds": {
+      "esbuild": true,
+      "puppeteer": "impure"
+    }
+  }
+}
 ```
 
 `allowBuilds` in `pnpm-workspace.yaml` is honored as well, and entries in `package.json` take precedence:
@@ -40,6 +51,19 @@ allowBuilds:
   esbuild: true
 ```
 
+Install scripts that compile against system libraries can get them from nixpkgs, by attribute path. Packages with build inputs must be allowed to build in the sandbox:
+
+```json
+{
+  "hinata": {
+    "allowBuilds": ["canvas"],
+    "buildInputs": { "canvas": ["cairo", "pango", "pkg-config"] }
+  }
+}
+```
+
+When an install script fails, hinata suggests `"impure"` if the script appears to have needed the network, and `buildInputs` if it appears to have been missing a library, header or `pkg-config`.
+
 ## Workspaces
 
 Directories matched by `packages` in `pnpm-workspace.yaml` are resolved together into one lockfile, and each gets its own `node_modules`. Dependencies on other workspace packages must use the `workspace:` protocol (`workspace:*`, `workspace:^1.0.0` or `workspace:name@*`) and are linked to their directories; other ranges always come from the registry.
@@ -47,7 +71,7 @@ Directories matched by `packages` in `pnpm-workspace.yaml` are resolved together
 ```yaml
 packages:
   - packages/*
-  - '!packages/legacy'
+  - "!packages/legacy"
 ```
 
 ## pnpm

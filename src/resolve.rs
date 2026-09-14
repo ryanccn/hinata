@@ -837,6 +837,7 @@ fn build_packages(
                 install_script: manifest.has_install_script,
                 build: false,
                 impure_build: false,
+                build_inputs: Vec::new(),
             },
         );
     }

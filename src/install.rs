@@ -201,6 +201,7 @@ fn update_lock(
     options: &Options,
 ) -> Result<(Lock, String, &'static str)> {
     let manifest = manifest::read(root)?;
+    let build_inputs = manifest.build_inputs()?;
     let projects = read_projects(root, &manifest)?;
     let existing = manifest::read_if_exists(lock_path)
         .wrap_err("reading hinata.lock")?
@@ -282,7 +283,12 @@ fn update_lock(
         }
     };
 
-    mark_builds(&mut lock, &manifest.allow_builds(), pnpm_only);
+    mark_builds(
+        &mut lock,
+        &manifest.allow_builds(),
+        &build_inputs,
+        pnpm_only,
+    );
     let json = lock::to_json(&lock)?;
     if pnpm_only {
         return Ok((lock, json, pnpm::LOCKFILE));
@@ -311,7 +317,12 @@ fn warn_missing_updates(names: &BTreeSet<String>, lock: &Lock) {
     }
 }
 
-fn mark_builds(lock: &mut Lock, allow_builds: &BTreeMap<String, BuildMode>, pnpm_only: bool) {
+fn mark_builds(
+    lock: &mut Lock,
+    allow_builds: &BTreeMap<String, BuildMode>,
+    build_inputs: &BTreeMap<String, Vec<String>>,
+    pnpm_only: bool,
+) {
     let mut skipped = BTreeSet::new();
     for package in lock.packages.values_mut() {
         // pnpm lockfiles do not record which packages have install scripts.
@@ -320,6 +331,12 @@ fn mark_builds(lock: &mut Lock, allow_builds: &BTreeMap<String, BuildMode>, pnpm
             .filter(|_| pnpm_only || package.install_script);
         package.build = mode == Some(&BuildMode::Sandboxed);
         package.impure_build = mode == Some(&BuildMode::Impure);
+        package.build_inputs = build_inputs
+            .get(&package.name)
+            .filter(|_| package.build)
+            .cloned()
+            .unwrap_or_default();
+
         if package.install_script && mode.is_none() {
             skipped.insert(package.name.clone());
         }
@@ -451,7 +468,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manifest = |range: &str| {
             format!(
-                r#"{{ "dependencies": {{ "a": "{range}", "b": "^1.0.0" }}, "devDependencies": {{ "node": "runtime:22.18.0" }}, "hinata": {{ "allowBuilds": {{ "a": true, "b": "impure" }} }} }}"#
+                r#"{{ "dependencies": {{ "a": "{range}", "b": "^1.0.0" }}, "devDependencies": {{ "node": "runtime:22.18.0" }}, "hinata": {{ "allowBuilds": {{ "a": true, "b": "impure" }}, "buildInputs": {{ "a": ["cairo"] }} }} }}"#
             )
         };
         fs::write(dir.path().join("package.json"), manifest("^1.0.0")).unwrap();
@@ -498,6 +515,7 @@ snapshots:
         assert_eq!(file, pnpm::LOCKFILE);
         assert!(lock.packages["a@1.0.0"].build);
         assert!(!lock.packages["a@1.0.0"].impure_build);
+        assert_eq!(lock.packages["a@1.0.0"].build_inputs, ["cairo"]);
         assert!(!lock.packages["b@1.0.0"].build);
         assert!(lock.packages["b@1.0.0"].impure_build);
         assert!(!lock_path.exists());

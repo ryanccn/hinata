@@ -44,6 +44,8 @@ pub struct Package {
     pub build: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub impure_build: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub build_inputs: Vec<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

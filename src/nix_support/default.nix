@@ -132,6 +132,12 @@ let
           ${lib.optionalString (p.hasBin or false) ''markBinsExecutable "$dest"''}
         '';
 
+      buildInputOf =
+        id: attr:
+        lib.attrByPath (lib.splitString "." attr)
+          (throw "hinata: ${id} has build input ${attr}, which is not in nixpkgs")
+          pkgs;
+
       buildMember =
         id:
         lib.optionalString (packages.${id}.build or false) ''
@@ -167,6 +173,9 @@ let
               pkgs.cctools
               pkgs.xcbuild
             ];
+            buildInputs = lib.concatMap (
+              id: map (buildInputOf id) (packages.${id}.buildInputs or [ ])
+            ) members;
             npm_config_nodedir = nodejs;
             nodeGyp = "${nodejs}/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js";
           } script

@@ -201,6 +201,7 @@ fn convert(pnpm: PnpmLock) -> Result<Lock> {
             install_script: false,
             build: false,
             impure_build: false,
+            build_inputs: Vec::new(),
         };
         packages.insert(id, package);
     }

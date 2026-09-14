@@ -48,6 +48,24 @@ linkBins() {
     done
 }
 
+scriptHints() {
+    local package="$1" log="$2" missing
+    if grep -qE 'ENOTFOUND|EAI_AGAIN|getaddrinfo|Could not resolve host|Temporary failure in name resolution' "$log"; then
+        echo "hinata: hint: the install scripts of $package may need network access, which the Nix sandbox does not allow; setting it to \"impure\" in hinata.allowBuilds runs them outside the sandbox" >&2
+    fi
+
+    missing=$(sed -nE \
+        -e "s/.*No package '([^']+)' found.*/\1/p" \
+        -e "s/.*Package '?([^' ,]+)'?,? (was not found|required by .*not found).*/\1/p" \
+        -e "s/.*fatal error: '?([^' :]+\.h)'?(: No such file or directory| file not found).*/\1/p" \
+        -e 's/.*(cannot find|library not found for) -l([^ :]+).*/-l\2/p' \
+        -e 's/.*(pkg-config|pkgconf): (command )?not found.*/pkg-config/p' \
+        "$log" | sort -u | paste -sd ' ' -)
+    if [ -n "$missing" ]; then
+        echo "hinata: hint: the install scripts of $package could not find $missing; if nixpkgs provides them, add them to hinata.buildInputs.$package" >&2
+    fi
+}
+
 runInstallScripts() {
     local package="$1" nodeModules="$2" event script file
     linkBins "$nodeModules"
@@ -55,6 +73,7 @@ runInstallScripts() {
     printf '#!%s\nexec node "%s" "$@"\n' "$(command -v sh)" "$nodeGyp" > "$TMPDIR/hinata-bin/node-gyp"
     chmod +x "$TMPDIR/hinata-bin/node-gyp"
     (
+        set -o pipefail
         cd "$package"
         export PATH="$nodeModules/.bin:$TMPDIR/hinata-bin:$PATH" HOME="$TMPDIR"
         export npm_package_name npm_package_version
@@ -68,8 +87,13 @@ runInstallScripts() {
                 script="node-gyp rebuild"
             fi
             [ -n "$script" ] || continue
+
             echo "hinata: $event $npm_package_name: $script"
-            npm_lifecycle_event=$event sh -c "$script"
+            npm_lifecycle_event=$event sh -c "$script" 2>&1 | tee "$TMPDIR/hinata-script.log" || {
+                status=$?
+                scriptHints "$npm_package_name" "$TMPDIR/hinata-script.log"
+                exit "$status"
+            }
         done
     )
 

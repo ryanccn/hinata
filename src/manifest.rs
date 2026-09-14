@@ -34,6 +34,8 @@ pub struct Manifest {
 struct HinataConfig {
     #[serde(default)]
     allow_builds: AllowBuilds,
+    #[serde(default)]
+    build_inputs: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -72,6 +74,8 @@ struct PnpmWorkspace {
     packages: Vec<String>,
     #[serde(default)]
     allow_builds: BTreeMap<String, bool>,
+    #[serde(default)]
+    build_inputs: BTreeMap<String, Vec<String>>,
 }
 
 impl Manifest {
@@ -135,6 +139,28 @@ impl Manifest {
             }
         }
         builds
+    }
+
+    /// Nixpkgs attribute paths added to the sandboxed builds of each package.
+    pub fn build_inputs(&self) -> Result<BTreeMap<String, Vec<String>>> {
+        let mut inputs = self.workspace.build_inputs.clone();
+        inputs.extend(self.hinata.build_inputs.clone());
+        inputs.retain(|_, attrs| !attrs.is_empty());
+
+        let allow_builds = self.allow_builds();
+        for name in inputs.keys() {
+            match allow_builds.get(name) {
+                Some(BuildMode::Sandboxed) => {}
+                Some(BuildMode::Impure) => bail!(
+                    "{name} has build inputs, but its install scripts run outside the Nix sandbox, where build inputs do not apply"
+                ),
+                None => bail!(
+                    "{name} has build inputs, but its install scripts are not allowed to run; add it to hinata.allowBuilds"
+                ),
+            }
+        }
+
+        Ok(inputs)
     }
 }
 
@@ -421,6 +447,44 @@ mod tests {
         )
         .unwrap();
         assert!(read(dir.path()).is_err());
+    }
+
+    #[test]
+    fn reads_build_inputs_for_sandboxed_builds() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{ "hinata": { "allowBuilds": ["a", "b"], "buildInputs": { "a": ["cairo", "xorg.libX11"], "b": [] } } }"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "buildInputs:\n  a: [vips]\n  b: [vips]\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            read(dir.path()).unwrap().build_inputs().unwrap(),
+            BTreeMap::from([(
+                "a".to_string(),
+                vec!["cairo".to_string(), "xorg.libX11".to_string()]
+            )])
+        );
+
+        for (config, message) in [
+            (
+                r#"{ "hinata": { "buildInputs": { "a": ["cairo"] } } }"#,
+                "not allowed to run",
+            ),
+            (
+                r#"{ "hinata": { "allowBuilds": { "a": "impure" }, "buildInputs": { "a": ["cairo"] } } }"#,
+                "outside the Nix sandbox",
+            ),
+        ] {
+            fs::write(dir.path().join("package.json"), config).unwrap();
+            let error = read(dir.path()).unwrap().build_inputs().unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+        }
     }
 
     #[test]
