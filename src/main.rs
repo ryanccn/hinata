@@ -12,6 +12,7 @@ mod logging;
 mod manifest;
 mod nix;
 mod pnpm;
+mod push;
 mod registry;
 mod resolve;
 mod run;
@@ -22,7 +23,7 @@ use std::process::ExitStatus;
 use clap::{Parser, Subcommand};
 use eyre::Result;
 
-use crate::install::Update;
+use crate::install::{Lockfile, Update};
 use crate::manifest::Group;
 
 #[derive(Parser)]
@@ -89,6 +90,15 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Push packages built by install scripts, with their dependencies, to a Nix binary cache
+    Push {
+        /// Nix store URI, such as `s3://bucket` or `file:///srv/cache`
+        #[arg(required_unless_present = "print")]
+        store: Option<String>,
+        /// Print the store paths instead, for tools such as cachix or attic
+        #[arg(long, conflicts_with = "store")]
+        print: bool,
+    },
     /// Remove GC roots of projects that no longer exist and clear cached registry metadata
     Gc,
 }
@@ -102,7 +112,7 @@ fn main() -> Result<()> {
         dev: true,
         refresh: false,
         update,
-        save_lock: true,
+        lockfile: Lockfile::Save,
     };
 
     match cli.command {
@@ -113,7 +123,11 @@ fn main() -> Result<()> {
         } => install::run(&install::Options {
             dev: !prod,
             refresh,
-            save_lock,
+            lockfile: if save_lock {
+                Lockfile::Save
+            } else {
+                Lockfile::Default
+            },
             ..install(Update::Keep)
         })?,
         Command::Add {
@@ -140,6 +154,7 @@ fn main() -> Result<()> {
         }
         Command::Run { script, args } => exit_with(run::script(&cli.dir, &script, &args)?),
         Command::Exec { program, args } => exit_with(run::exec(&cli.dir, &program, &args)?),
+        Command::Push { store, .. } => push::run(&cli.dir, store.as_deref())?,
         Command::Gc => gc::run()?,
     }
     Ok(())

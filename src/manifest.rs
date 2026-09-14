@@ -40,6 +40,8 @@ struct HinataConfig {
     build_inputs: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     patched_dependencies: BTreeMap<String, String>,
+    #[serde(default)]
+    substituters: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -192,6 +194,11 @@ impl Manifest {
                 Ok((key, Patch { path, hash }))
             })
             .collect()
+    }
+
+    /// Binary cache URLs and their public keys.
+    pub fn substituters(&self) -> &BTreeMap<String, String> {
+        &self.hinata.substituters
     }
 }
 

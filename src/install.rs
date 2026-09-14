@@ -33,7 +33,17 @@ pub struct Options {
     pub dev: bool,
     pub refresh: bool,
     pub update: Update,
-    pub save_lock: bool,
+    pub lockfile: Lockfile,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Lockfile {
+    /// Fail rather than resolve, and never write a lockfile.
+    Frozen,
+    /// Write hinata.lock, unless installing from a matching pnpm-lock.yaml.
+    Default,
+    /// Write hinata.lock even when installing from pnpm-lock.yaml.
+    Save,
 }
 
 pub enum Update {
@@ -66,14 +76,19 @@ struct ImporterRoots {
 pub fn run(options: &Options) -> Result<()> {
     let root = fs::canonicalize(&options.dir)
         .wrap_err_with(|| format!("opening {}", options.dir.display()))?;
-    let lock_path = root.join(LOCKFILE);
-    let (lock, lock_json, lock_file) = update_lock(&root, &lock_path, options)?;
+    let manifest = manifest::read(&root)?;
+    let (lock, lock_json, lock_file) = update_lock(
+        &root,
+        &manifest,
+        &root.join(LOCKFILE),
+        &options.update,
+        options.lockfile,
+    )?;
 
     let cache = cache_dir()?;
     remove_legacy_cache(&cache);
-    let projects = cache.join("projects");
-    prune_projects(&projects);
-    let project = projects.join(hex(Sha256::digest(root.as_os_str().as_bytes())));
+    prune_projects(&cache.join("projects"));
+    let project = project_dir(&root)?;
     fs::create_dir_all(&project).wrap_err_with(|| format!("creating {}", project.display()))?;
     let project_path = project.join("path");
     fs::write(&project_path, root.as_os_str().as_bytes())
@@ -110,8 +125,15 @@ pub fn run(options: &Options) -> Result<()> {
             {
                 return Err(error).wrap_err_with(|| format!("removing {}", key_path.display()));
             }
-            let workspace =
-                nix::build_workspace(&root, &lock, &lock_json, options.dev, node, &gcroot)?;
+            let workspace = nix::build_workspace(
+                &root,
+                &lock,
+                &lock_json,
+                options.dev,
+                node,
+                manifest.substituters(),
+                &gcroot,
+            )?;
             debug!(
                 "built workspace {}",
                 workspace.display().log_display::<Blue>()
@@ -146,6 +168,34 @@ pub fn run(options: &Options) -> Result<()> {
         }
     );
     Ok(())
+}
+
+/// The workspace of the last install, if it still matches the project.
+pub fn current_workspace(root: &Path) -> Result<Option<PathBuf>> {
+    let manifest = manifest::read(root)?;
+    let (lock, lock_json, _) = update_lock(
+        root,
+        &manifest,
+        &root.join(LOCKFILE),
+        &Update::Keep,
+        Lockfile::Frozen,
+    )?;
+
+    let project = project_dir(root)?;
+    let node = native_addon_node(root, &lock);
+
+    Ok([true, false].into_iter().find_map(|dev| {
+        cached_workspace(
+            &project.join("key"),
+            &project.join("gcroot"),
+            &cache_key(&lock_json, dev, node),
+        )
+    }))
+}
+
+fn project_dir(root: &Path) -> Result<PathBuf> {
+    let hash = hex(Sha256::digest(root.as_os_str().as_bytes()));
+    Ok(cache_dir()?.join("projects").join(hash))
 }
 
 fn native_addon_node(root: &Path, lock: &Lock) -> Option<u32> {
@@ -198,13 +248,14 @@ fn link_importers(root: &Path, lock: &Lock, workspace: &Path) -> Result<()> {
 
 fn update_lock(
     root: &Path,
+    manifest: &Manifest,
     lock_path: &Path,
-    options: &Options,
+    update: &Update,
+    lockfile: Lockfile,
 ) -> Result<(Lock, String, &'static str)> {
-    let manifest = manifest::read(root)?;
     let build_inputs = manifest.build_inputs()?;
     let patches = manifest.patches(root)?;
-    let projects = read_projects(root, &manifest)?;
+    let projects = read_projects(root, manifest)?;
     let existing = manifest::read_if_exists(lock_path)
         .wrap_err("reading hinata.lock")?
         .map(|json| serde_json::from_str::<Lock>(&json))
@@ -215,7 +266,7 @@ fn update_lock(
         None => pnpm::read(root, &patches)?,
     };
     let from_pnpm = pnpm_lock.is_some();
-    if let Update::Only(names) = &options.update
+    if let Update::Only(names) = update
         && let Some(lock) = existing.as_ref().or(pnpm_lock.as_ref())
     {
         warn_missing_updates(names, lock);
@@ -230,7 +281,7 @@ fn update_lock(
                 })
             })
     };
-    let keep = matches!(options.update, Update::Keep);
+    let keep = matches!(update, Update::Keep);
     let (mut lock, pnpm_only) = match (existing, pnpm_lock) {
         (Some(lock), _) if keep && current(&lock) => {
             debug!(
@@ -240,7 +291,7 @@ fn update_lock(
             (lock, false)
         }
         (None, Some(mut lock)) if keep && current(&lock) => {
-            if options.save_lock {
+            if lockfile == Lockfile::Save {
                 info!(
                     "looking up install scripts in {}",
                     DEFAULT_REGISTRY.log_display::<Blue>()
@@ -255,11 +306,14 @@ fn update_lock(
                 (lock, true)
             }
         }
-        (None, Some(_)) if !options.save_lock => bail!(
+        (None, Some(_)) if lockfile != Lockfile::Save => bail!(
             "{} does not match package.json; run `pnpm install` to update it, or `hinata install --save-lock` to resolve dependencies into {} instead",
             pnpm::LOCKFILE,
             LOCKFILE
         ),
+        _ if lockfile == Lockfile::Frozen => {
+            bail!("{LOCKFILE} does not match package.json; run `hinata install` first")
+        }
         (existing, pnpm_lock) => {
             info!(
                 "resolving dependencies from {}",
@@ -270,7 +324,7 @@ fn update_lock(
                 .map(|lock| {
                     lock.packages
                         .into_values()
-                        .filter(|package| !options.update.includes(&package.name))
+                        .filter(|package| !update.includes(&package.name))
                         .map(|package| (package.name, package.version))
                         .collect()
                 })
@@ -297,7 +351,9 @@ fn update_lock(
     if pnpm_only {
         return Ok((lock, json, pnpm::LOCKFILE));
     }
-    write_lock(lock_path, &json, from_pnpm)?;
+    if lockfile != Lockfile::Frozen {
+        write_lock(lock_path, &json, from_pnpm)?;
+    }
     Ok((lock, json, LOCKFILE))
 }
 
@@ -535,16 +591,16 @@ snapshots:
 ",
         )
         .unwrap();
-        let options = Options {
-            dir: dir.path().to_path_buf(),
-            dev: true,
-            refresh: false,
-            update: Update::Keep,
-            save_lock: false,
-        };
         let lock_path = dir.path().join(LOCKFILE);
 
-        let (lock, _, file) = update_lock(dir.path(), &lock_path, &options).unwrap();
+        let (lock, _, file) = update_lock(
+            dir.path(),
+            &manifest::read(dir.path()).unwrap(),
+            &lock_path,
+            &Update::Keep,
+            Lockfile::Default,
+        )
+        .unwrap();
         assert_eq!(file, pnpm::LOCKFILE);
         assert!(lock.packages["a@1.0.0"].build);
         assert!(!lock.packages["a@1.0.0"].impure_build);
@@ -558,7 +614,14 @@ snapshots:
         assert_eq!(patch("b@1.0.0"), "b.patch");
 
         fs::write(dir.path().join("package.json"), manifest("^2.0.0")).unwrap();
-        let error = update_lock(dir.path(), &lock_path, &options).unwrap_err();
+        let error = update_lock(
+            dir.path(),
+            &manifest::read(dir.path()).unwrap(),
+            &lock_path,
+            &Update::Keep,
+            Lockfile::Default,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("pnpm install"));
         assert!(!lock_path.exists());
     }
@@ -605,16 +668,16 @@ snapshots:
 ",
         )
         .unwrap();
-        let options = Options {
-            dir: dir.path().to_path_buf(),
-            dev: true,
-            refresh: false,
-            update: Update::Keep,
-            save_lock: false,
-        };
         let lock_path = dir.path().join(LOCKFILE);
 
-        let (lock, _, file) = update_lock(dir.path(), &lock_path, &options).unwrap();
+        let (lock, _, file) = update_lock(
+            dir.path(),
+            &manifest::read(dir.path()).unwrap(),
+            &lock_path,
+            &Update::Keep,
+            Lockfile::Default,
+        )
+        .unwrap();
         assert_eq!(file, pnpm::LOCKFILE);
         assert_eq!(lock.importers.len(), 2);
 
@@ -623,12 +686,49 @@ snapshots:
             r#"{ "name": "shared", "dependencies": { "a": "^2.0.0" } }"#,
         )
         .unwrap();
-        let error = update_lock(dir.path(), &lock_path, &options).unwrap_err();
+        let error = update_lock(
+            dir.path(),
+            &manifest::read(dir.path()).unwrap(),
+            &lock_path,
+            &Update::Keep,
+            Lockfile::Default,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("pnpm install"));
 
         fs::remove_file(shared.join("package.json")).unwrap();
-        let error = update_lock(dir.path(), &lock_path, &options).unwrap_err();
+        let error = update_lock(
+            dir.path(),
+            &manifest::read(dir.path()).unwrap(),
+            &lock_path,
+            &Update::Keep,
+            Lockfile::Default,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("pnpm install"));
+    }
+
+    #[test]
+    fn frozen_installs_neither_resolve_nor_write() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{ "dependencies": { "a": "^1.0.0" } }"#,
+        )
+        .unwrap();
+        let lock_path = dir.path().join(LOCKFILE);
+
+        let manifest = manifest::read(dir.path()).unwrap();
+        let error = update_lock(
+            dir.path(),
+            &manifest,
+            &lock_path,
+            &Update::Keep,
+            Lockfile::Frozen,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("hinata install"), "{error}");
+        assert!(!lock_path.exists());
     }
 
     #[test]

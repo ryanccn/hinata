@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -36,6 +37,7 @@ pub fn build_workspace(
     lock_json: &str,
     dev: bool,
     node_major: Option<u32>,
+    substituters: &BTreeMap<String, String>,
     out_link: &Path,
 ) -> Result<PathBuf> {
     let scratch = tempfile::Builder::new()
@@ -82,6 +84,15 @@ pub fn build_workspace(
 
     if let Some(major) = node_major {
         command.args(["--arg", "nodeMajor", &major.to_string()]);
+    }
+
+    // Nix ignores these, with a warning, unless the user is trusted or they are trusted substituters.
+    if !substituters.is_empty() {
+        let urls: Vec<&str> = substituters.keys().map(String::as_str).collect();
+        let keys: Vec<&str> = substituters.values().map(String::as_str).collect();
+        command
+            .args(["--extra-substituters", &urls.join(" ")])
+            .args(["--extra-trusted-public-keys", &keys.join(" ")]);
     }
 
     let output = command

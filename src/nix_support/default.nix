@@ -219,7 +219,7 @@ let
 
       groups = lib.mapAttrs mkGroup (lib.groupBy groupOf (lib.attrNames packages));
 
-      importerRoots =
+      importerIds =
         {
           importer ? ".",
           dev ? true,
@@ -228,19 +228,39 @@ let
           imp =
             lock.importers.${importer} or (throw "hinata: no importer ${importer} in ${toString lockFile}");
           who = "importer ${importer}";
-          roots = lib.mapAttrs (_: rootOf);
         in
         {
-          dependencies = roots (resolve who (imp.dependencies or { }) { });
-          devDependencies = lib.optionalAttrs dev (roots (resolve who (imp.devDependencies or { }) { }));
-          optionalDependencies = roots (resolve who { } (imp.optionalDependencies or { }));
+          dependencies = resolve who (imp.dependencies or { }) { };
+          devDependencies = lib.optionalAttrs dev (resolve who (imp.devDependencies or { }) { });
+          optionalDependencies = resolve who { } (imp.optionalDependencies or { });
         };
+
+      importerRoots = args: lib.mapAttrs (_: lib.mapAttrs (_: rootOf)) (importerIds args);
+
+      buildsFor =
+        dev:
+        let
+          roots = lib.concatMap (
+            importer: lib.concatMap lib.attrValues (lib.attrValues (importerIds { inherit importer dev; }))
+          ) (lib.attrNames lock.importers);
+
+          reachable = builtins.genericClosure {
+            startSet = map (id: { key = id; }) roots;
+            operator = { key }: map (id: { key = id; }) (lib.attrValues (depsOf key));
+          };
+        in
+        lib.unique (
+          map (item: groups.${groupOf item.key}) (
+            lib.filter (item: packages.${item.key}.build or false) reachable
+          )
+        );
     in
     {
       inherit
         lock
         packages
         importerRoots
+        buildsFor
         rootOf
         ;
 
@@ -296,9 +316,11 @@ let
             lib.filterAttrs (_: p: p.impureBuild or false) loaded.packages
           )
         );
+        builds = builtins.toJSON (loaded.buildsFor dev);
         passAsFile = [
           "importers"
           "impureBuilds"
+          "builds"
         ];
         preferLocalBuild = true;
         allowSubstitutes = false;
@@ -307,6 +329,7 @@ let
         mkdir -p "$out"
         cp "$importersPath" "$out/importers.json"
         cp "$impureBuildsPath" "$out/impure-builds.json"
+        cp "$buildsPath" "$out/builds.json"
       '';
 
   buildNodeApp =

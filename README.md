@@ -13,26 +13,38 @@ hinata resolves `package.json` against the npm registry into `hinata.lock`. Each
 ## Usage
 
 ```sh
-hinata install            # resolve, build, and link node_modules
-hinata add [-D|-O|-E] <pkg>
-hinata remove <pkg>
-hinata update [pkg...]
-hinata run <script>
-hinata exec <command>
-hinata gc                 # remove stale GC roots and cached registry metadata
+hinata install                # resolve, build, and link node_modules
+hinata add [-D|-O|-E] <pkg>   # add dependencies and install them
+hinata remove <pkg>           # remove dependencies and uninstall them
+hinata update [pkg...]        # update dependencies within their ranges
+hinata run <script>           # run a package.json script
+hinata exec <command>         # run a command with node_modules/.bin on PATH
+hinata push <store-uri>       # push packages built by install scripts to a binary cache
+hinata gc                     # remove stale GC roots and cached registry metadata
 ```
 
-Install scripts only run for packages listed in `package.json`:
+## Projects
 
-```json
-{
-  "hinata": {
-    "allowBuilds": ["esbuild"]
-  }
-}
+Without a `hinata.lock`, `hinata install` installs from `pnpm-lock.yaml` (lockfile version 9.0) as long as it matches `package.json`, and leaves both files untouched. `hinata install --save-lock`, `add`, `remove` and `update` write a `hinata.lock`, which takes precedence from then on.
+
+Directories matched by `packages` in `pnpm-workspace.yaml` are resolved together into one lockfile, and each gets its own `node_modules`. Dependencies on other workspace packages must use the `workspace:` protocol (`workspace:*`, `workspace:^1.0.0` or `workspace:name@*`) and are linked to their directories; other ranges always come from the registry.
+
+```yaml
+packages:
+  - packages/*
+  - "!packages/legacy"
 ```
 
-Install scripts run in the Nix sandbox, without network access. Scripts that download things, for example into `~/.cache`, can run after linking instead, outside the sandbox and against the read-only package:
+## Configuration
+
+hinata is configured under `hinata` in `package.json`. `allowBuilds`, `buildInputs` and `patchedDependencies` can also be set in `pnpm-workspace.yaml`, and entries in `package.json` take precedence:
+
+```yaml
+allowBuilds:
+  esbuild: true
+```
+
+Install scripts only run for packages listed in `allowBuilds`. They run in the Nix sandbox, without network access. Scripts that download things, for example into `~/.cache`, can run after linking instead, outside the sandbox and against the read-only package:
 
 ```json
 {
@@ -45,27 +57,20 @@ Install scripts run in the Nix sandbox, without network access. Scripts that dow
 }
 ```
 
-`allowBuilds` in `pnpm-workspace.yaml` is honored as well, and entries in `package.json` take precedence:
-
-```yaml
-allowBuilds:
-  esbuild: true
-```
-
-Install scripts that compile against system libraries can get them from nixpkgs, by attribute path. Packages with build inputs must be allowed to build in the sandbox:
+Install scripts that compile against system libraries can get them from nixpkgs, by attribute path, through `buildInputs`. Packages with build inputs must be allowed to build in the sandbox:
 
 ```json
 {
   "hinata": {
     "allowBuilds": ["canvas"],
-    "buildInputs": { "canvas": ["cairo", "pango", "pkg-config"] }
+    "buildInputs": {
+      "canvas": ["cairo", "pango", "pkg-config"]
+    }
   }
 }
 ```
 
 When an install script fails, hinata suggests `"impure"` if the script appears to have needed the network, and `buildInputs` if it appears to have been missing a library, header or `pkg-config`.
-
-## Patches
 
 Patches listed in `patchedDependencies` are applied with `patch -p1`, as produced by `git diff`, before install scripts run. Keys are `name@version` for one version or `name` for every version, and paths are relative to the project. `hinata.lock` records a hash of each patch, so editing one rebuilds the package.
 
@@ -79,21 +84,28 @@ Patches listed in `patchedDependencies` are applied with `patch -p1`, as produce
 }
 ```
 
-`patchedDependencies` in `pnpm-workspace.yaml` is honored as well, and entries in `package.json` take precedence.
+## Binary caches
 
-## Workspaces
+Packages built by install scripts can be pushed to a Nix binary cache after installing, so that machines on the same platform and Node.js major version download them instead of building them again:
 
-Directories matched by `packages` in `pnpm-workspace.yaml` are resolved together into one lockfile, and each gets its own `node_modules`. Dependencies on other workspace packages must use the `workspace:` protocol (`workspace:*`, `workspace:^1.0.0` or `workspace:name@*`) and are linked to their directories; other ranges always come from the registry.
-
-```yaml
-packages:
-  - packages/*
-  - "!packages/legacy"
+```sh
+hinata push 's3://my-cache?secret-key=/run/secrets/cache-key'   # any Nix store URI
+hinata push --print | cachix push my-cache
 ```
 
-## pnpm
+Projects list the caches to download from in `substituters`, with their public keys:
 
-Without a `hinata.lock`, `hinata install` installs from `pnpm-lock.yaml` (lockfile version 9.0) as long as it matches `package.json`, and leaves both files untouched. `hinata install --save-lock`, `add`, `remove` and `update` write a `hinata.lock`, which takes precedence from then on. The Nix library only reads `hinata.lock`.
+```json
+{
+  "hinata": {
+    "substituters": {
+      "https://my-cache.cachix.org": "my-cache.cachix.org-1:…"
+    }
+  }
+}
+```
+
+Nix only uses these for trusted users, or when `trusted-substituters` in `nix.conf` lists them.
 
 ## Nix
 
@@ -108,11 +120,4 @@ The flake exposes the library for building apps without a dependency hash:
 }
 ```
 
-## Missing
-
-- `workspace:` dependencies on paths, and injected workspace dependencies
-- Running commands from inside a workspace package rather than the root
-- Git, file and URL dependencies
-- `.npmrc` registries and authentication
-- `overrides` and `packageExtensions`
-- Packages that rely on undeclared dependencies being hoisted
+The library only reads `hinata.lock`, and does not use `substituters`; configure caches for it in `nix.conf` or the flake's `nixConfig`.
