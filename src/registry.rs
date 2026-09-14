@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::collections::BTreeMap;
-use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
 use std::num::NonZero;
@@ -146,12 +145,7 @@ impl HttpRegistry {
             .chain_update("\n")
             .chain_update(self.packument_url(name))
             .finalize();
-        let mut file = String::new();
-        for byte in digest {
-            write!(file, "{byte:02x}").expect("writing to a string succeeds");
-        }
-        file.push_str(".json");
-        self.cache.join(file)
+        self.cache.join(format!("{}.json", install::hex(digest)))
     }
 }
 

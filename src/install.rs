@@ -3,9 +3,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::ErrorKind;
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -14,6 +17,7 @@ use log::{debug, info, warn};
 use owo_colors::OwoColorize as _;
 use owo_colors::colors::{Blue, Yellow};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 use crate::lock::{self, Lock};
 use crate::logging::{LogDisplay as _, plural};
@@ -66,15 +70,16 @@ pub fn run(options: &Options) -> Result<()> {
     let (lock, lock_json, lock_file) = update_lock(&root, &lock_path, options)?;
 
     let cache = cache_dir()?;
-    let gcroots = cache.join("gcroots");
-    let keys = cache.join("keys");
-    for dir in [&gcroots, &keys] {
-        fs::create_dir_all(dir).wrap_err_with(|| format!("creating {}", dir.display()))?;
-        prune_cache(dir);
-    }
-    let name = escape_path(&root);
-    let gcroot = gcroots.join(&name);
-    let key_path = keys.join(&name);
+    remove_legacy_cache(&cache);
+    let projects = cache.join("projects");
+    prune_projects(&projects);
+    let project = projects.join(hex(Sha256::digest(root.as_os_str().as_bytes())));
+    fs::create_dir_all(&project).wrap_err_with(|| format!("creating {}", project.display()))?;
+    let project_path = project.join("path");
+    fs::write(&project_path, root.as_os_str().as_bytes())
+        .wrap_err_with(|| format!("writing {}", project_path.display()))?;
+    let gcroot = project.join("gcroot");
+    let key_path = project.join("key");
 
     let node = native_addon_node(&root, &lock);
     let key = cache_key(&lock_json, options.dev, node);
@@ -400,23 +405,34 @@ pub(crate) fn cache_dir() -> Result<PathBuf> {
     Ok(cache.join("hinata"))
 }
 
-fn escape_path(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('%', "%25")
-        .replace('/', "%2F")
+pub(crate) fn hex(bytes: impl IntoIterator<Item = u8>) -> String {
+    let mut hex = String::new();
+    for byte in bytes {
+        write!(hex, "{byte:02x}").expect("writing to a string succeeds");
+    }
+    hex
 }
 
-fn unescape_path(name: &str) -> PathBuf {
-    PathBuf::from(name.replace("%2F", "/").replace("%25", "%"))
+fn remove_legacy_cache(cache: &Path) {
+    for name in ["gcroots", "keys"] {
+        let dir = cache.join(name);
+        if fs::remove_dir_all(&dir).is_ok() {
+            debug!("removed {}", dir.display().log_display::<Blue>());
+        }
+    }
 }
 
-fn prune_cache(dir: &Path) {
-    let Ok(entries) = fs::read_dir(dir) else {
+/// Entries without a `path` file may belong to an install that is still setting them up.
+fn prune_projects(projects: &Path) {
+    let Ok(entries) = fs::read_dir(projects) else {
         return;
     };
     for entry in entries.flatten() {
-        let project = unescape_path(&entry.file_name().to_string_lossy());
-        if !project.exists() && fs::remove_file(entry.path()).is_ok() {
+        let Ok(project) = fs::read(entry.path().join("path")) else {
+            continue;
+        };
+        let project = PathBuf::from(OsString::from_vec(project));
+        if !project.exists() && fs::remove_dir_all(entry.path()).is_ok() {
             debug!(
                 "removed {} of {}, which no longer exists",
                 entry.path().display().log_display::<Blue>(),
@@ -561,11 +577,22 @@ snapshots:
     }
 
     #[test]
-    fn escapes_paths_reversibly() {
-        for path in ["/Users/me/app", "/tmp/100%/a%2Fb", "/"] {
-            let name = escape_path(Path::new(path));
-            assert!(!name.contains('/'));
-            assert_eq!(unescape_path(&name), PathBuf::from(path));
+    fn prunes_projects_that_no_longer_exist() {
+        let cache = tempfile::tempdir().unwrap();
+        let live = tempfile::tempdir().unwrap();
+        let projects = cache.path().join("projects");
+        for (name, path) in [
+            ("live", live.path().as_os_str().as_bytes()),
+            ("gone", b"/nonexistent/hinata-project".as_slice()),
+        ] {
+            fs::create_dir_all(projects.join(name)).unwrap();
+            fs::write(projects.join(name).join("path"), path).unwrap();
         }
+        fs::create_dir_all(projects.join("pending")).unwrap();
+
+        prune_projects(&projects);
+        assert!(projects.join("live").exists());
+        assert!(!projects.join("gone").exists());
+        assert!(projects.join("pending").exists());
     }
 }
