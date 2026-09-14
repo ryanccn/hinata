@@ -8,12 +8,10 @@
 }:
 
 let
+  lock = builtins.fromJSON (builtins.readFile ../hinata.lock);
+
   pkgs =
-    import
-      (builtins.fetchTarball {
-        url = "https://github.com/NixOS/nixpkgs/archive/02f5696b0e6097e589076d886b317b83ff0437d7.tar.gz";
-        sha256 = "sha256-llGJbC0CcU8DfROr6mZjRJgMLQd/SKwfpzxJH/2lHO4=";
-      })
+    import (builtins.fetchTree lock.nixpkgs.locked).outPath
       {
         system = builtins.currentSystem;
         # Explicit, so that user nixpkgs configuration cannot change the build.
@@ -26,7 +24,7 @@ let
       pkgs.nodejs
     else
       pkgs."nodejs_${toString nodeMajor}"
-        or (throw "hinata: the pinned nixpkgs has no nodejs_${toString nodeMajor}, so it cannot build native addons for the Node.js ${toString nodeMajor} on your PATH");
+        or (throw "hinata: the locked Nixpkgs has no nodejs_${toString nodeMajor}, so it cannot build native addons for the Node.js ${toString nodeMajor} on your PATH; run hinata update --nixpkgs, or set hinata.nixpkgs to a newer revision");
 in
 (import ./. { inherit pkgs nodejs; }).mkWorkspace {
   lockFile = ../hinata.lock;

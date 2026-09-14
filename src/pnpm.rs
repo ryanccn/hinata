@@ -248,6 +248,7 @@ fn convert(pnpm: PnpmLock) -> Result<Lock> {
 
     Ok(Lock {
         version: lock::VERSION,
+        nixpkgs: None,
         sccs: lock::find_cycles(&packages),
         packages,
         importers,

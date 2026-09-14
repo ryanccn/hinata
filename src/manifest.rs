@@ -42,6 +42,7 @@ struct HinataConfig {
     patched_dependencies: BTreeMap<String, String>,
     #[serde(default)]
     substituters: BTreeMap<String, String>,
+    nixpkgs: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -199,6 +200,11 @@ impl Manifest {
     /// Binary cache URLs and their public keys.
     pub fn substituters(&self) -> &BTreeMap<String, String> {
         &self.hinata.substituters
+    }
+
+    /// The flake reference to lock Nixpkgs from.
+    pub fn nixpkgs(&self) -> Option<&str> {
+        self.hinata.nixpkgs.as_deref()
     }
 }
 

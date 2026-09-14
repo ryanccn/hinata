@@ -101,6 +101,7 @@ fn install_or_restore(root: &Path, document: &Document) -> Result<()> {
         dev: true,
         refresh: false,
         update: Update::Keep,
+        update_nixpkgs: false,
         lockfile: install::Lockfile::Save,
     });
     if result.is_err() {

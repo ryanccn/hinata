@@ -10,6 +10,8 @@ A JavaScript package manager that builds `node_modules` with Nix.
 
 hinata resolves `package.json` against the npm registry into `hinata.lock`. Each package becomes its own Nix derivation, with its dependencies linked beside it as in pnpm's layout, and install scripts run offline in the Nix sandbox. The project's `node_modules` is a writable directory of links into the store.
 
+Install scripts only run for packages you allow, and can't reach anything outside the Nix sandbox. A package that compiles a native module is built once and reused by every project with the same version and dependencies, and the build can be pushed to a binary cache so CI and other machines never repeat it. Libraries it compiles against come from Nixpkgs instead of whatever is installed on the machine. And because the lockfile already pins everything, apps build in Nix straight from `hinata.lock`, with no dependency hash to keep updated.
+
 ## Usage
 
 ```sh
@@ -17,6 +19,7 @@ hinata install                # resolve, build, and link node_modules
 hinata add [-D|-O|-E] <pkg>   # add dependencies and install them
 hinata remove <pkg>           # remove dependencies and uninstall them
 hinata update [pkg...]        # update dependencies within their ranges
+hinata update --nixpkgs       # lock Nixpkgs again
 hinata run <script>           # run a package.json script
 hinata exec <command>         # run a command with node_modules/.bin on PATH
 hinata push <store-uri>       # push packages built by install scripts to a binary cache
@@ -57,7 +60,7 @@ Install scripts only run for packages listed in `allowBuilds`. They run in the N
 }
 ```
 
-Install scripts that compile against system libraries can get them from nixpkgs, by attribute path, through `buildInputs`. Packages with build inputs must be allowed to build in the sandbox:
+Install scripts that compile against system libraries can get them from Nixpkgs, by attribute path, through `buildInputs`. Packages with build inputs must be allowed to build in the sandbox:
 
 ```json
 {
@@ -66,6 +69,16 @@ Install scripts that compile against system libraries can get them from nixpkgs,
     "buildInputs": {
       "canvas": ["cairo", "pango", "pkg-config"]
     }
+  }
+}
+```
+
+Packages are built with the Nixpkgs revision locked in `hinata.lock`. It is locked from the flake reference in `nixpkgs` if there is one, then from the `nixpkgs` input in the project's `flake.lock`, and otherwise from `nixpkgs-unstable`. A revision from `flake.lock` follows that file, and others stay the same until `hinata update --nixpkgs` locks them again:
+
+```json
+{
+  "hinata": {
+    "nixpkgs": "github:NixOS/nixpkgs/nixos-25.05"
   }
 }
 ```
@@ -120,4 +133,4 @@ The flake exposes the library for building apps without a dependency hash:
 }
 ```
 
-The library only reads `hinata.lock`, and does not use `substituters`; configure caches for it in `nix.conf` or the flake's `nixConfig`.
+The library only reads `hinata.lock`, builds with the `pkgs` it is given rather than the locked Nixpkgs, and does not use `substituters`; configure caches for it in `nix.conf` or the flake's `nixConfig`.

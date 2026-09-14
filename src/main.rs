@@ -78,9 +78,14 @@ enum Command {
         #[arg(required = true)]
         packages: Vec<String>,
     },
-    /// Update dependencies to the newest versions their ranges allow (all of them by default)
+    /// Update dependencies to the newest versions their ranges allow (all of them, unless packages or --nixpkgs are given)
     #[command(alias = "up")]
-    Update { packages: Vec<String> },
+    Update {
+        packages: Vec<String>,
+        /// Lock Nixpkgs again from `hinata.nixpkgs`
+        #[arg(long)]
+        nixpkgs: bool,
+    },
     /// Run a package.json script
     Run {
         script: String,
@@ -115,6 +120,7 @@ fn main() -> Result<()> {
         dev: true,
         refresh: false,
         update,
+        update_nixpkgs: false,
         lockfile: Lockfile::Save,
     };
 
@@ -148,13 +154,16 @@ fn main() -> Result<()> {
             edit::add(&cli.dir, &packages, group, save_exact)?;
         }
         Command::Remove { packages } => edit::remove(&cli.dir, &packages)?,
-        Command::Update { packages } => {
-            let update = if packages.is_empty() {
-                Update::All
-            } else {
-                Update::Only(packages.into_iter().collect())
+        Command::Update { packages, nixpkgs } => {
+            let update = match (packages.is_empty(), nixpkgs) {
+                (true, true) => Update::Keep,
+                (true, false) => Update::All,
+                (false, _) => Update::Only(packages.into_iter().collect()),
             };
-            install::run(&install(update))?;
+            install::run(&install::Options {
+                update_nixpkgs: nixpkgs,
+                ..install(update)
+            })?;
         }
         Command::Run { script, args } => exit_with(run::script(&cli.dir, &script, &args)?),
         Command::Exec { program, args } => exit_with(run::exec(&cli.dir, &program, &args)?),

@@ -27,12 +27,28 @@ use crate::resolve::Project;
 use crate::{impure, link, manifest, nix, pnpm, resolve};
 
 const LOCKFILE: &str = "hinata.lock";
+/// Installs from pnpm-lock.yaml have no hinata.lock to record Nixpkgs in.
+const REMEMBERED_NIXPKGS: &str = "nixpkgs.json";
+/// Locked when neither hinata.nixpkgs nor flake.lock chooses Nixpkgs.
+const DEFAULT_NIXPKGS: &str = "github:NixOS/nixpkgs/nixpkgs-unstable";
+
+struct NixpkgsSource<'a> {
+    /// Lock again even if Nixpkgs is already locked.
+    update: bool,
+    remembered: Option<lock::Nixpkgs>,
+    lock: &'a dyn Fn(&str) -> Result<lock::Nixpkgs>,
+}
+
+fn remembered_nixpkgs(project: &Path) -> Option<lock::Nixpkgs> {
+    serde_json::from_str(&fs::read_to_string(project.join(REMEMBERED_NIXPKGS)).ok()?).ok()
+}
 
 pub struct Options {
     pub dir: PathBuf,
     pub dev: bool,
     pub refresh: bool,
     pub update: Update,
+    pub update_nixpkgs: bool,
     pub lockfile: Lockfile,
 }
 
@@ -77,19 +93,30 @@ pub fn run(options: &Options) -> Result<()> {
     let root = fs::canonicalize(&options.dir)
         .wrap_err_with(|| format!("opening {}", options.dir.display()))?;
     let manifest = manifest::read(&root)?;
+    let cache = cache_dir()?;
+    remove_legacy_cache(&cache);
+    prune_projects(&cache.join("projects"));
+    let project = project_dir(&root)?;
+
     let (lock, lock_json, lock_file) = update_lock(
         &root,
         &manifest,
         &root.join(LOCKFILE),
         &options.update,
         options.lockfile,
+        &NixpkgsSource {
+            update: options.update_nixpkgs,
+            remembered: remembered_nixpkgs(&project),
+            lock: &nix::lock_nixpkgs,
+        },
     )?;
 
-    let cache = cache_dir()?;
-    remove_legacy_cache(&cache);
-    prune_projects(&cache.join("projects"));
-    let project = project_dir(&root)?;
     fs::create_dir_all(&project).wrap_err_with(|| format!("creating {}", project.display()))?;
+    if lock_file == pnpm::LOCKFILE {
+        let path = project.join(REMEMBERED_NIXPKGS);
+        fs::write(&path, serde_json::to_string(&lock.nixpkgs)?)
+            .wrap_err_with(|| format!("writing {}", path.display()))?;
+    }
     let project_path = project.join("path");
     fs::write(&project_path, root.as_os_str().as_bytes())
         .wrap_err_with(|| format!("writing {}", project_path.display()))?;
@@ -173,15 +200,20 @@ pub fn run(options: &Options) -> Result<()> {
 /// The workspace of the last install, if it still matches the project.
 pub fn current_workspace(root: &Path) -> Result<Option<PathBuf>> {
     let manifest = manifest::read(root)?;
+    let project = project_dir(root)?;
     let (lock, lock_json, _) = update_lock(
         root,
         &manifest,
         &root.join(LOCKFILE),
         &Update::Keep,
         Lockfile::Frozen,
+        &NixpkgsSource {
+            update: false,
+            remembered: remembered_nixpkgs(&project),
+            lock: &nix::lock_nixpkgs,
+        },
     )?;
 
-    let project = project_dir(root)?;
     let node = native_addon_node(root, &lock);
 
     Ok([true, false].into_iter().find_map(|dev| {
@@ -252,6 +284,7 @@ fn update_lock(
     lock_path: &Path,
     update: &Update,
     lockfile: Lockfile,
+    source: &NixpkgsSource,
 ) -> Result<(Lock, String, &'static str)> {
     let build_inputs = manifest.build_inputs()?;
     let patches = manifest.patches(root)?;
@@ -261,9 +294,9 @@ fn update_lock(
         .map(|json| serde_json::from_str::<Lock>(&json))
         .transpose()
         .wrap_err("parsing hinata.lock")?;
-    let pnpm_lock = match existing {
-        Some(_) => None,
-        None => pnpm::read(root, &patches)?,
+    let (pnpm_lock, pinned) = match &existing {
+        Some(lock) => (None, lock.nixpkgs.clone()),
+        None => (pnpm::read(root, &patches)?, source.remembered.clone()),
     };
     let from_pnpm = pnpm_lock.is_some();
     if let Update::Only(names) = update
@@ -345,6 +378,8 @@ fn update_lock(
     );
     mark_patches(&mut lock, &patches);
 
+    lock.nixpkgs = Some(pick_nixpkgs(root, pinned, manifest, lockfile, source)?);
+
     let json = lock::to_json(&lock)?;
     if pnpm_only {
         return Ok((lock, json, pnpm::LOCKFILE));
@@ -355,6 +390,41 @@ fn update_lock(
         return Err(outdated_lock());
     }
     Ok((lock, json, LOCKFILE))
+}
+
+/// flake.lock is followed whenever it changes, while other sources stay locked until updated.
+fn pick_nixpkgs(
+    root: &Path,
+    locked: Option<lock::Nixpkgs>,
+    manifest: &Manifest,
+    lockfile: Lockfile,
+    source: &NixpkgsSource,
+) -> Result<lock::Nixpkgs> {
+    if manifest.nixpkgs().is_none()
+        && let Some(flake) = nix::flake_lock_nixpkgs(root)?
+    {
+        return match locked {
+            Some(locked) if locked == flake => Ok(locked),
+            _ if lockfile == Lockfile::Frozen => Err(outdated_lock()),
+            _ => {
+                info!(
+                    "locking Nixpkgs from {}",
+                    nix::FLAKE_LOCK.log_display::<Blue>()
+                );
+                Ok(flake)
+            }
+        };
+    }
+
+    let flake_ref = manifest.nixpkgs().unwrap_or(DEFAULT_NIXPKGS);
+    match locked {
+        Some(locked) if !source.update && locked.from == flake_ref => Ok(locked),
+        _ if lockfile == Lockfile::Frozen => Err(outdated_lock()),
+        _ => {
+            info!("locking Nixpkgs from {}", flake_ref.log_display::<Blue>());
+            (source.lock)(flake_ref)
+        }
+    }
 }
 
 fn outdated_lock() -> eyre::Report {
@@ -552,7 +622,24 @@ pub(crate) fn prune_projects(projects: &Path) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use super::*;
+
+    fn locked_nixpkgs(from: &str) -> lock::Nixpkgs {
+        lock::Nixpkgs {
+            from: from.to_string(),
+            locked: BTreeMap::from([("rev".to_string(), "abc".into())]),
+        }
+    }
+
+    fn source() -> NixpkgsSource<'static> {
+        NixpkgsSource {
+            update: false,
+            remembered: None,
+            lock: &|from| Ok(locked_nixpkgs(from)),
+        }
+    }
 
     #[test]
     fn installs_from_a_matching_pnpm_lockfile() {
@@ -603,9 +690,15 @@ snapshots:
             &lock_path,
             &Update::Keep,
             Lockfile::Default,
+            &NixpkgsSource {
+                update: false,
+                remembered: Some(locked_nixpkgs(DEFAULT_NIXPKGS)),
+                lock: &|_| unreachable!("remembered Nixpkgs is locked again"),
+            },
         )
         .unwrap();
         assert_eq!(file, pnpm::LOCKFILE);
+        assert_eq!(lock.nixpkgs, Some(locked_nixpkgs(DEFAULT_NIXPKGS)));
         assert!(lock.packages["a@1.0.0"].build);
         assert!(!lock.packages["a@1.0.0"].impure_build);
         assert_eq!(lock.packages["a@1.0.0"].build_inputs, ["cairo"]);
@@ -624,6 +717,7 @@ snapshots:
             &lock_path,
             &Update::Keep,
             Lockfile::Default,
+            &source(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("pnpm install"));
@@ -680,6 +774,7 @@ snapshots:
             &lock_path,
             &Update::Keep,
             Lockfile::Default,
+            &source(),
         )
         .unwrap();
         assert_eq!(file, pnpm::LOCKFILE);
@@ -696,6 +791,7 @@ snapshots:
             &lock_path,
             &Update::Keep,
             Lockfile::Default,
+            &source(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("pnpm install"));
@@ -707,6 +803,7 @@ snapshots:
             &lock_path,
             &Update::Keep,
             Lockfile::Default,
+            &source(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("pnpm install"));
@@ -724,6 +821,7 @@ snapshots:
                 &lock_path,
                 &Update::Keep,
                 Lockfile::Frozen,
+                &source(),
             )
         };
 
@@ -731,7 +829,7 @@ snapshots:
         assert!(error.to_string().contains("hinata install"), "{error}");
         assert!(!lock_path.exists());
 
-        let compact = r#"{"version":1,"packages":{},"sccs":[],"importers":{".":{}}}"#;
+        let compact = r#"{"version":1,"nixpkgs":{"from":"github:NixOS/nixpkgs/nixpkgs-unstable","locked":{"rev":"abc"}},"packages":{},"sccs":[],"importers":{".":{}}}"#;
         fs::write(&lock_path, compact).unwrap();
         assert!(frozen().is_err());
         assert_eq!(fs::read_to_string(&lock_path).unwrap(), compact);
@@ -739,6 +837,108 @@ snapshots:
         let pretty = lock::to_json(&serde_json::from_str(compact).unwrap()).unwrap();
         fs::write(&lock_path, pretty).unwrap();
         assert!(frozen().is_ok());
+    }
+
+    #[test]
+    fn keeps_nixpkgs_locked_until_it_is_updated() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        let lock_path = dir.path().join(LOCKFILE);
+        write_unpinned_lock(&lock_path);
+
+        let calls = Cell::new(0);
+        let lock_nixpkgs = |from: &str| {
+            calls.set(calls.get() + 1);
+            Ok(lock::Nixpkgs {
+                from: from.to_string(),
+                locked: BTreeMap::from([("rev".to_string(), calls.get().into())]),
+            })
+        };
+        let install = |update, lockfile| {
+            update_lock(
+                dir.path(),
+                &manifest::read(dir.path()).unwrap(),
+                &lock_path,
+                &Update::Keep,
+                lockfile,
+                &NixpkgsSource {
+                    update,
+                    remembered: None,
+                    lock: &lock_nixpkgs,
+                },
+            )
+            .map(|(lock, _, _)| lock.nixpkgs.unwrap().locked["rev"].clone())
+        };
+
+        assert!(install(false, Lockfile::Frozen).is_err());
+        assert_eq!(install(false, Lockfile::Default).unwrap(), 1);
+        assert_eq!(install(false, Lockfile::Frozen).unwrap(), 1);
+        assert_eq!(install(true, Lockfile::Default).unwrap(), 2);
+
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{ "hinata": { "nixpkgs": "github:NixOS/nixpkgs/nixos-25.05" } }"#,
+        )
+        .unwrap();
+        assert!(install(false, Lockfile::Frozen).is_err());
+        assert_eq!(install(false, Lockfile::Default).unwrap(), 3);
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[test]
+    fn follows_nixpkgs_in_flake_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        let lock_path = dir.path().join(LOCKFILE);
+        write_unpinned_lock(&lock_path);
+
+        let flake_lock = |rev: &str| {
+            fs::write(
+                dir.path().join(nix::FLAKE_LOCK),
+                format!(
+                    r#"{{ "nodes": {{ "root": {{ "inputs": {{ "nixpkgs": "nixpkgs_2" }} }}, "nixpkgs_2": {{ "locked": {{ "type": "github", "owner": "NixOS", "repo": "nixpkgs", "rev": "{rev}", "narHash": "sha256-x" }} }} }}, "root": "root", "version": 7 }}"#
+                ),
+            )
+            .unwrap();
+        };
+        let install = |lockfile| {
+            update_lock(
+                dir.path(),
+                &manifest::read(dir.path()).unwrap(),
+                &lock_path,
+                &Update::Keep,
+                lockfile,
+                &NixpkgsSource {
+                    update: true,
+                    ..source()
+                },
+            )
+            .map(|(lock, _, _)| lock.nixpkgs.unwrap().locked["rev"].clone())
+        };
+
+        flake_lock("a");
+        assert_eq!(install(Lockfile::Default).unwrap(), "a");
+        assert_eq!(install(Lockfile::Frozen).unwrap(), "a");
+
+        flake_lock("b");
+        assert!(install(Lockfile::Frozen).is_err());
+        assert_eq!(install(Lockfile::Default).unwrap(), "b");
+
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{ "hinata": { "nixpkgs": "github:NixOS/nixpkgs/nixos-25.05" } }"#,
+        )
+        .unwrap();
+        assert_eq!(install(Lockfile::Default).unwrap(), "abc");
+    }
+
+    fn write_unpinned_lock(path: &Path) {
+        let unpinned = r#"{"version":1,"packages":{},"sccs":[],"importers":{".":{}}}"#;
+        fs::write(
+            path,
+            lock::to_json(&serde_json::from_str(unpinned).unwrap()).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
