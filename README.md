@@ -64,5 +64,3 @@ The flake exposes the library for building apps without a dependency hash:
 - `.npmrc` registries and authentication
 - `overrides` and `packageExtensions`
 - Packages that rely on undeclared dependencies being hoisted
-- Install scripts that download binaries
-- A metadata cache

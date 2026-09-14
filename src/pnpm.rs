@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -90,15 +90,34 @@ pub fn read(root: &Path) -> Result<Option<Lock>> {
 }
 
 pub fn fill_install_scripts(lock: &mut Lock, registry: &dyn Registry) -> Result<()> {
-    let names: Vec<String> = lock
-        .packages
-        .values()
-        .map(|package| package.name.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let fetched = registry.fetch(&names)?;
-    let packuments: HashMap<_, _> = names.into_iter().zip(fetched).collect();
+    let mut versions: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for package in lock.packages.values() {
+        versions
+            .entry(package.name.clone())
+            .or_default()
+            .push(package.version.clone());
+    }
+    let names: Vec<String> = versions.keys().cloned().collect();
+    let cached = registry.cached(&names);
+
+    let mut packuments = HashMap::new();
+    let mut outdated = Vec::new();
+    for (name, packument) in names.into_iter().zip(cached) {
+        match packument {
+            Some(packument)
+                if versions[&name]
+                    .iter()
+                    .all(|version| packument.versions.contains_key(version)) =>
+            {
+                packuments.insert(name, packument);
+            }
+            _ => outdated.push(name),
+        }
+    }
+    if !outdated.is_empty() {
+        let fetched = registry.fetch(&outdated)?;
+        packuments.extend(outdated.into_iter().zip(fetched));
+    }
     for (id, package) in &mut lock.packages {
         let manifest = packuments[&package.name]
             .versions

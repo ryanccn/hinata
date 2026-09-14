@@ -360,7 +360,7 @@ fn cached_workspace(key_path: &Path, gcroot: &Path, key: &str) -> Option<PathBuf
 }
 
 /// GC roots are kept outside projects, which the Nix daemon may not be permitted to read.
-fn cache_dir() -> Result<PathBuf> {
+pub(crate) fn cache_dir() -> Result<PathBuf> {
     let cache = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))

@@ -56,6 +56,29 @@ struct Node {
 struct Fetched {
     packument: Packument,
     versions: BTreeMap<Version, String>,
+    /// Cached packuments may predate versions and tags published since.
+    verified: bool,
+}
+
+impl Fetched {
+    fn new(packument: Packument, verified: bool) -> Self {
+        let versions = packument
+            .versions
+            .keys()
+            .filter_map(|raw| Some((Version::parse(raw).ok()?, raw.clone())))
+            .collect();
+        Self {
+            packument,
+            versions,
+            verified,
+        }
+    }
+
+    fn has_pinned_version(&self, range: &str, chosen: Option<&BTreeSet<Version>>) -> bool {
+        !self.packument.dist_tags.contains_key(range)
+            && pinned_version(range, chosen)
+                .is_some_and(|version| self.versions.contains_key(&version))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -160,13 +183,23 @@ impl Chooser<'_> {
     }
 
     fn fetch(&mut self, requests: &[Request]) -> Result<()> {
-        let names: Vec<String> = requests
-            .iter()
-            .filter(|request| !self.packuments.contains_key(&request.name))
-            .map(|request| request.name.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
+        let cacheable = unique_names(requests.iter().filter(|request| {
+            !self.packuments.contains_key(&request.name)
+                && pinned_version(&request.range, self.chosen.get(&request.name)).is_some()
+        }));
+        for (name, packument) in cacheable.iter().zip(self.registry.cached(&cacheable)) {
+            if let Some(packument) = packument {
+                self.packuments
+                    .insert(name.clone(), Fetched::new(packument, false));
+            }
+        }
+
+        let names = unique_names(requests.iter().filter(|request| {
+            self.packuments.get(&request.name).is_none_or(|fetched| {
+                !fetched.verified
+                    && !fetched.has_pinned_version(&request.range, self.chosen.get(&request.name))
+            })
+        }));
         if names.is_empty() {
             return Ok(());
         }
@@ -175,18 +208,8 @@ impl Chooser<'_> {
             plural(names.len(), "package", "packages")
         );
         for (name, packument) in names.iter().zip(self.registry.fetch(&names)?) {
-            let versions = packument
-                .versions
-                .keys()
-                .filter_map(|raw| Some((Version::parse(raw).ok()?, raw.clone())))
-                .collect();
-            self.packuments.insert(
-                name.clone(),
-                Fetched {
-                    packument,
-                    versions,
-                },
-            );
+            self.packuments
+                .insert(name.clone(), Fetched::new(packument, true));
         }
         Ok(())
     }
@@ -297,6 +320,30 @@ pub(crate) fn parse_spec(alias: &str, spec: &str) -> Result<(String, String)> {
     }
     let range = if range.is_empty() { "*" } else { range };
     Ok((name.to_string(), range.to_string()))
+}
+
+fn unique_names<'a>(requests: impl Iterator<Item = &'a Request>) -> Vec<String> {
+    requests
+        .map(|request| request.name.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// The version [`pick_version`] picks for `range` from any packument that has it, since published
+/// versions never change.
+fn pinned_version(range: &str, chosen: Option<&BTreeSet<Version>>) -> Option<Version> {
+    if let Ok(version) = Version::parse(range)
+        && version.to_string() == range
+    {
+        return Some(version);
+    }
+    let range = Range::parse(range).ok()?;
+    chosen?
+        .iter()
+        .rev()
+        .find(|version| range.satisfies(version))
+        .cloned()
 }
 
 fn pick_version(
@@ -676,48 +723,62 @@ fn build_lock(
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+    use std::cell::RefCell;
 
-    struct MemoryRegistry(HashMap<String, Value>);
+    #[derive(Default)]
+    struct MemoryRegistry {
+        packuments: HashMap<String, Value>,
+        cache: HashMap<String, Value>,
+        fetched: RefCell<BTreeSet<String>>,
+    }
 
     impl Registry for MemoryRegistry {
         fn fetch(&self, names: &[String]) -> Result<Vec<Packument>> {
+            self.fetched.borrow_mut().extend(names.iter().cloned());
             names
                 .iter()
                 .map(|name| {
                     let packument = self
-                        .0
+                        .packuments
                         .get(name)
                         .ok_or_else(|| eyre!("{name} is not in the registry"))?;
                     Ok(serde_json::from_value(packument.clone())?)
                 })
                 .collect()
         }
+
+        fn cached(&self, names: &[String]) -> Vec<Option<Packument>> {
+            names
+                .iter()
+                .map(|name| serde_json::from_value(self.cache.get(name)?.clone()).ok())
+                .collect()
+        }
     }
 
-    /// The last version of each package is tagged latest.
+    /// The last version is tagged latest.
+    fn packument(name: &str, versions: Vec<(&str, Value)>) -> Value {
+        let latest = versions.last().map(|(version, _)| version.to_string());
+        let versions: serde_json::Map<String, Value> = versions
+            .into_iter()
+            .map(|(version, mut manifest)| {
+                manifest["dist"] = json!({
+                    "tarball": format!("https://registry.test/{name}/-/{version}.tgz"),
+                    "integrity": format!("sha512-{name}-{version}"),
+                });
+                (version.to_string(), manifest)
+            })
+            .collect();
+        json!({ "dist-tags": { "latest": latest }, "versions": versions })
+    }
+
     fn registry(packages: Vec<(&str, Vec<(&str, Value)>)>) -> MemoryRegistry {
-        MemoryRegistry(
-            packages
+        MemoryRegistry {
+            packuments: packages
                 .into_iter()
-                .map(|(name, versions)| {
-                    let latest = versions.last().map(|(version, _)| version.to_string());
-                    let versions: serde_json::Map<String, Value> = versions
-                        .into_iter()
-                        .map(|(version, mut manifest)| {
-                            manifest["dist"] = json!({
-                                "tarball": format!("https://registry.test/{name}/-/{version}.tgz"),
-                                "integrity": format!("sha512-{name}-{version}"),
-                            });
-                            (version.to_string(), manifest)
-                        })
-                        .collect();
-                    (
-                        name.to_string(),
-                        json!({ "dist-tags": { "latest": latest }, "versions": versions }),
-                    )
-                })
+                .map(|(name, versions)| (name.to_string(), packument(name, versions)))
                 .collect(),
-        )
+            ..Default::default()
+        }
     }
 
     fn deps(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -835,6 +896,43 @@ mod tests {
 
         let lock = resolve(&specifiers(&[("c", "^1")]), &registry, &[]).unwrap();
         assert_eq!(lock.importers["."].dependencies["c"], "c@1.1.0");
+    }
+
+    #[test]
+    fn uses_cached_metadata_only_when_it_cannot_change_the_result() {
+        let mut registry = registry(vec![(
+            "c",
+            vec![("1.0.0", json!({})), ("1.1.0", json!({}))],
+        )]);
+        registry
+            .cache
+            .insert("c".to_string(), packument("c", vec![("1.0.0", json!({}))]));
+        let preferred = |locked: Option<&str>| -> Vec<(String, String)> {
+            locked
+                .map(|version| ("c".to_string(), version.to_string()))
+                .into_iter()
+                .collect()
+        };
+
+        for (spec, locked, expected, fetched) in [
+            ("^1", Some("1.0.0"), "c@1.0.0", false),
+            ("1.0.0", None, "c@1.0.0", false),
+            ("^1", Some("1.1.0"), "c@1.1.0", true),
+            ("^1", None, "c@1.1.0", true),
+            ("latest", Some("1.0.0"), "c@1.1.0", true),
+        ] {
+            registry.fetched.borrow_mut().clear();
+            let lock = resolve(&specifiers(&[("c", spec)]), &registry, &preferred(locked)).unwrap();
+            assert_eq!(
+                lock.importers["."].dependencies["c"], expected,
+                "{spec} {locked:?}"
+            );
+            assert_eq!(
+                registry.fetched.borrow().contains("c"),
+                fetched,
+                "{spec} {locked:?}"
+            );
+        }
     }
 
     #[test]
