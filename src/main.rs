@@ -53,6 +53,9 @@ enum Command {
         /// Write hinata.lock when installing from pnpm-lock.yaml
         #[arg(long)]
         save_lock: bool,
+        /// Fail instead of resolving dependencies or changing hinata.lock
+        #[arg(long, conflicts_with = "save_lock")]
+        frozen_lockfile: bool,
     },
     /// Add dependencies to package.json and install them
     Add {
@@ -120,13 +123,14 @@ fn main() -> Result<()> {
             prod,
             refresh,
             save_lock,
+            frozen_lockfile,
         } => install::run(&install::Options {
             dev: !prod,
             refresh,
-            lockfile: if save_lock {
-                Lockfile::Save
-            } else {
-                Lockfile::Default
+            lockfile: match (save_lock, frozen_lockfile) {
+                (_, true) => Lockfile::Frozen,
+                (true, _) => Lockfile::Save,
+                _ => Lockfile::Default,
             },
             ..install(Update::Keep)
         })?,

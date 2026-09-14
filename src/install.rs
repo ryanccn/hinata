@@ -38,7 +38,7 @@ pub struct Options {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Lockfile {
-    /// Fail rather than resolve, and never write a lockfile.
+    /// Fail rather than resolve or change hinata.lock.
     Frozen,
     /// Write hinata.lock, unless installing from a matching pnpm-lock.yaml.
     Default,
@@ -311,9 +311,7 @@ fn update_lock(
             pnpm::LOCKFILE,
             LOCKFILE
         ),
-        _ if lockfile == Lockfile::Frozen => {
-            bail!("{LOCKFILE} does not match package.json; run `hinata install` first")
-        }
+        _ if lockfile == Lockfile::Frozen => return Err(outdated_lock()),
         (existing, pnpm_lock) => {
             info!(
                 "resolving dependencies from {}",
@@ -353,8 +351,14 @@ fn update_lock(
     }
     if lockfile != Lockfile::Frozen {
         write_lock(lock_path, &json, from_pnpm)?;
+    } else if fs::read_to_string(lock_path).ok().as_deref() != Some(json.as_str()) {
+        return Err(outdated_lock());
     }
     Ok((lock, json, LOCKFILE))
+}
+
+fn outdated_lock() -> eyre::Report {
+    eyre!("{LOCKFILE} is missing or out of date; run `hinata install` to update it")
 }
 
 fn read_projects(root: &Path, manifest: &Manifest) -> Result<BTreeMap<String, Project>> {
@@ -709,26 +713,32 @@ snapshots:
     }
 
     #[test]
-    fn frozen_installs_neither_resolve_nor_write() {
+    fn frozen_installs_fail_instead_of_changing_the_lockfile() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(
-            dir.path().join("package.json"),
-            r#"{ "dependencies": { "a": "^1.0.0" } }"#,
-        )
-        .unwrap();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
         let lock_path = dir.path().join(LOCKFILE);
+        let frozen = || {
+            update_lock(
+                dir.path(),
+                &manifest::read(dir.path()).unwrap(),
+                &lock_path,
+                &Update::Keep,
+                Lockfile::Frozen,
+            )
+        };
 
-        let manifest = manifest::read(dir.path()).unwrap();
-        let error = update_lock(
-            dir.path(),
-            &manifest,
-            &lock_path,
-            &Update::Keep,
-            Lockfile::Frozen,
-        )
-        .unwrap_err();
+        let error = frozen().unwrap_err();
         assert!(error.to_string().contains("hinata install"), "{error}");
         assert!(!lock_path.exists());
+
+        let compact = r#"{"version":1,"packages":{},"sccs":[],"importers":{".":{}}}"#;
+        fs::write(&lock_path, compact).unwrap();
+        assert!(frozen().is_err());
+        assert_eq!(fs::read_to_string(&lock_path).unwrap(), compact);
+
+        let pretty = lock::to_json(&serde_json::from_str(compact).unwrap()).unwrap();
+        fs::write(&lock_path, pretty).unwrap();
+        assert!(frozen().is_ok());
     }
 
     #[test]
