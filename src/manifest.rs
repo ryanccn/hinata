@@ -32,7 +32,36 @@ pub struct Manifest {
 #[serde(rename_all = "camelCase")]
 struct HinataConfig {
     #[serde(default)]
-    allow_builds: BTreeSet<String>,
+    allow_builds: AllowBuilds,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AllowBuilds {
+    Names(BTreeSet<String>),
+    Map(BTreeMap<String, AllowBuild>),
+}
+
+impl Default for AllowBuilds {
+    fn default() -> Self {
+        AllowBuilds::Names(BTreeSet::new())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AllowBuild {
+    Allowed(bool),
+    Mode(BuildMode),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BuildMode {
+    #[serde(skip)]
+    Sandboxed,
+    /// Runs after linking, outside the Nix sandbox, so that the scripts can download things.
+    Impure,
 }
 
 #[derive(Deserialize, Default)]
@@ -43,19 +72,39 @@ struct PnpmWorkspace {
 }
 
 impl Manifest {
-    pub fn allow_builds(&self) -> BTreeSet<String> {
-        let workspace = self
+    pub fn allow_builds(&self) -> BTreeMap<String, BuildMode> {
+        let mut builds: BTreeMap<String, BuildMode> = self
             .workspace
             .allow_builds
             .iter()
             .filter(|(_, allowed)| **allowed)
-            .map(|(name, _)| name);
-        self.hinata
-            .allow_builds
-            .iter()
-            .chain(workspace)
-            .cloned()
-            .collect()
+            .map(|(name, _)| (name.clone(), BuildMode::Sandboxed))
+            .collect();
+        match &self.hinata.allow_builds {
+            AllowBuilds::Names(names) => {
+                builds.extend(
+                    names
+                        .iter()
+                        .map(|name| (name.clone(), BuildMode::Sandboxed)),
+                );
+            }
+            AllowBuilds::Map(entries) => {
+                for (name, entry) in entries {
+                    match entry {
+                        AllowBuild::Allowed(true) => {
+                            builds.insert(name.clone(), BuildMode::Sandboxed);
+                        }
+                        AllowBuild::Allowed(false) => {
+                            builds.remove(name);
+                        }
+                        AllowBuild::Mode(mode) => {
+                            builds.insert(name.clone(), *mode);
+                        }
+                    }
+                }
+            }
+        }
+        builds
     }
 }
 
@@ -228,7 +277,40 @@ mod tests {
         assert_eq!(manifest.specifiers.dependencies["a"], "^1");
         assert_eq!(
             manifest.allow_builds(),
-            BTreeSet::from(["esbuild".to_string(), "sharp".to_string()])
+            BTreeMap::from([
+                ("esbuild".to_string(), BuildMode::Sandboxed),
+                ("sharp".to_string(), BuildMode::Sandboxed),
+            ])
         );
+    }
+
+    #[test]
+    fn reads_impure_builds_and_overrides_pnpm_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{ "hinata": { "allowBuilds": { "esbuild": true, "puppeteer": "impure", "sharp": false } } }"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "allowBuilds:\n  sharp: true\n  puppeteer: true\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            read(dir.path()).unwrap().allow_builds(),
+            BTreeMap::from([
+                ("esbuild".to_string(), BuildMode::Sandboxed),
+                ("puppeteer".to_string(), BuildMode::Impure),
+            ])
+        );
+
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{ "hinata": { "allowBuilds": { "esbuild": "sandboxed" } } }"#,
+        )
+        .unwrap();
+        assert!(read(dir.path()).is_err());
     }
 }

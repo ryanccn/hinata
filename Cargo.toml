@@ -16,7 +16,7 @@ log = { version = "0.4", features = ["std"] }
 node-semver = "2"
 owo-colors = "4"
 petgraph = "0.8"
-reqwest = { version = "0.13", default-features = false, features = ["json", "gzip", "http2"] }
+reqwest = { version = "0.13", features = ["json", "gzip", "brotli", "zstd"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"

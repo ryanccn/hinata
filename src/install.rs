@@ -17,8 +17,9 @@ use serde::Deserialize;
 
 use crate::lock::{self, Lock};
 use crate::logging::{LogDisplay as _, plural};
+use crate::manifest::BuildMode;
 use crate::registry::{DEFAULT_REGISTRY, HttpRegistry};
-use crate::{link, manifest, nix, pnpm, resolve};
+use crate::{impure, link, manifest, nix, pnpm, resolve};
 
 const LOCKFILE: &str = "hinata.lock";
 
@@ -91,14 +92,14 @@ pub fn run(options: &Options) -> Result<()> {
     }
     let key = cache_key(&lock_json, options.dev, node);
 
-    let workspace = match cached_workspace(&key_path, &gcroot, &key) {
+    let (workspace, built) = match cached_workspace(&key_path, &gcroot, &key) {
         Some(workspace) if !options.refresh => {
             info!(
                 "{} is unchanged since the last install, skipping the Nix build {}",
                 lock_file.log_display::<Blue>(),
                 "(pass --refresh to rebuild)".dimmed()
             );
-            workspace
+            (workspace, false)
         }
         _ => {
             info!(
@@ -123,9 +124,7 @@ pub fn run(options: &Options) -> Result<()> {
                 "built workspace {}",
                 workspace.display().log_display::<Blue>()
             );
-            fs::write(&key_path, &key)
-                .wrap_err_with(|| format!("writing {}", key_path.display()))?;
-            workspace
+            (workspace, true)
         }
     };
 
@@ -153,6 +152,17 @@ pub fn run(options: &Options) -> Result<()> {
         );
         link::sync(&node_modules, &packages)
             .wrap_err_with(|| format!("linking {}", node_modules.display()))?;
+    }
+
+    if built {
+        let impure_builds: BTreeMap<String, PathBuf> =
+            serde_json::from_str(&fs::read_to_string(workspace.join("impure-builds.json"))?)?;
+        for (id, dir) in &impure_builds {
+            let package = &lock.packages[id];
+            impure::run(&root, &package.name, &package.version, dir)?;
+        }
+        // Written last, so that failed impure builds run again on the next install.
+        fs::write(&key_path, &key).wrap_err_with(|| format!("writing {}", key_path.display()))?;
     }
 
     info!(
@@ -268,9 +278,12 @@ fn update_lock(
     let mut skipped = BTreeSet::new();
     for package in lock.packages.values_mut() {
         // pnpm lockfiles do not record which packages have install scripts.
-        package.build =
-            allow_builds.contains(&package.name) && (pnpm_only || package.install_script);
-        if package.install_script && !package.build {
+        let mode = allow_builds
+            .get(&package.name)
+            .filter(|_| pnpm_only || package.install_script);
+        package.build = mode == Some(&BuildMode::Sandboxed);
+        package.impure_build = mode == Some(&BuildMode::Impure);
+        if package.install_script && mode.is_none() {
             skipped.insert(package.name.clone());
         }
     }
@@ -390,7 +403,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manifest = |range: &str| {
             format!(
-                r#"{{ "dependencies": {{ "a": "{range}", "b": "^1.0.0" }}, "devDependencies": {{ "node": "runtime:22.18.0" }}, "hinata": {{ "allowBuilds": ["a"] }} }}"#
+                r#"{{ "dependencies": {{ "a": "{range}", "b": "^1.0.0" }}, "devDependencies": {{ "node": "runtime:22.18.0" }}, "hinata": {{ "allowBuilds": {{ "a": true, "b": "impure" }} }} }}"#
             )
         };
         fs::write(dir.path().join("package.json"), manifest("^1.0.0")).unwrap();
@@ -436,7 +449,9 @@ snapshots:
         let (lock, _, file) = update_lock(dir.path(), &lock_path, &options).unwrap();
         assert_eq!(file, pnpm::LOCKFILE);
         assert!(lock.packages["a@1.0.0"].build);
+        assert!(!lock.packages["a@1.0.0"].impure_build);
         assert!(!lock.packages["b@1.0.0"].build);
+        assert!(lock.packages["b@1.0.0"].impure_build);
         assert!(!lock_path.exists());
 
         fs::write(dir.path().join("package.json"), manifest("^2.0.0")).unwrap();

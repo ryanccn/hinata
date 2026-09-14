@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 mod edit;
+mod impure;
 mod install;
 mod link;
 mod lock;

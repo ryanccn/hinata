@@ -648,6 +648,7 @@ fn build_lock(
                 has_bin: manifest.has_bin(),
                 install_script: manifest.has_install_script,
                 build: false,
+                impure_build: false,
             },
         );
     }

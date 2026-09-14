@@ -177,6 +177,7 @@ fn convert(pnpm: PnpmLock) -> Result<Lock> {
             has_bin: entry.has_bin,
             install_script: false,
             build: false,
+            impure_build: false,
         };
         packages.insert(id, package);
     }

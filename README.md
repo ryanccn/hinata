@@ -27,7 +27,13 @@ Install scripts only run for packages listed in `package.json`:
 { "hinata": { "allowBuilds": ["esbuild"] } }
 ```
 
-`allowBuilds` in `pnpm-workspace.yaml` is honored as well:
+Install scripts run in the Nix sandbox, without network access. Scripts that download things, for example into `~/.cache`, can run after linking instead, outside the sandbox and against the read-only package:
+
+```json
+{ "hinata": { "allowBuilds": { "esbuild": true, "puppeteer": "impure" } } }
+```
+
+`allowBuilds` in `pnpm-workspace.yaml` is honored as well, and entries in `package.json` take precedence:
 
 ```yaml
 allowBuilds:

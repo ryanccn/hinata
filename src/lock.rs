@@ -18,6 +18,7 @@ pub struct Lock {
     pub importers: BTreeMap<String, Importer>,
 }
 
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Package {
@@ -41,6 +42,8 @@ pub struct Package {
     pub install_script: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub build: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub impure_build: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

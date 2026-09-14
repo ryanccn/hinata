@@ -202,7 +202,12 @@ let
         };
     in
     {
-      inherit lock importerRoots;
+      inherit
+        lock
+        packages
+        importerRoots
+        rootOf
+        ;
 
       nodeModulesFor =
         {
@@ -246,11 +251,28 @@ let
     let
       loaded = loadLock lockFile;
     in
-    pkgs.writeTextDir "importers.json" (
-      builtins.toJSON (
-        lib.mapAttrs (importer: _: loaded.importerRoots { inherit importer dev; }) loaded.lock.importers
-      )
-    );
+    pkgs.runCommand "hinata-workspace"
+      {
+        importers = builtins.toJSON (
+          lib.mapAttrs (importer: _: loaded.importerRoots { inherit importer dev; }) loaded.lock.importers
+        );
+        impureBuilds = builtins.toJSON (
+          lib.mapAttrs (id: _: loaded.rootOf id) (
+            lib.filterAttrs (_: p: p.impureBuild or false) loaded.packages
+          )
+        );
+        passAsFile = [
+          "importers"
+          "impureBuilds"
+        ];
+        preferLocalBuild = true;
+        allowSubstitutes = false;
+      }
+      ''
+        mkdir -p "$out"
+        cp "$importersPath" "$out/importers.json"
+        cp "$impureBuildsPath" "$out/impure-builds.json"
+      '';
 
   buildNodeApp =
     {
