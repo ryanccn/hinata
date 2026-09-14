@@ -10,14 +10,12 @@
 let
   lock = builtins.fromJSON (builtins.readFile ../hinata.lock);
 
-  pkgs =
-    import (builtins.fetchTree lock.nixpkgs.locked).outPath
-      {
-        system = builtins.currentSystem;
-        # Explicit, so that user nixpkgs configuration cannot change the build.
-        config = { };
-        overlays = [ ];
-      };
+  pkgs = import (builtins.fetchTree lock.nixpkgs.locked).outPath {
+    system = builtins.currentSystem;
+    # Explicit, so that user nixpkgs configuration cannot change the build.
+    config = { };
+    overlays = [ ];
+  };
 
   nodejs =
     if nodeMajor == null then

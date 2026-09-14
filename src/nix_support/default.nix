@@ -187,9 +187,7 @@ let
               pkgs.cctools
               pkgs.xcbuild
             ];
-            buildInputs = lib.concatMap (
-              id: map (buildInputOf id) (packages.${id}.buildInputs or [ ])
-            ) members;
+            buildInputs = lib.concatMap (id: map (buildInputOf id) (packages.${id}.buildInputs or [ ])) members;
             npm_config_nodedir = nodejs;
             nodeGyp = "${nodejs}/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js";
           } script
@@ -241,7 +239,12 @@ let
         dev:
         let
           roots = lib.concatMap (
-            importer: lib.concatMap lib.attrValues (lib.attrValues (importerIds { inherit importer dev; }))
+            importer:
+            lib.concatMap lib.attrValues (
+              lib.attrValues (importerIds {
+                inherit importer dev;
+              })
+            )
           ) (lib.attrNames lock.importers);
 
           reachable = builtins.genericClosure {
