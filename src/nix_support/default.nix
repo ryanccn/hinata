@@ -114,6 +114,19 @@ let
             allowSubstitutes = false;
           });
 
+      patchFile =
+        p:
+        let
+          file = builtins.path {
+            path = dirOf lockFile + "/${p.patch.path}";
+            name = lib.strings.sanitizeDerivationName "${p.name}-${p.version}.patch";
+          };
+        in
+        if builtins.hashFile "sha256" file == p.patch.hash then
+          file
+        else
+          throw "hinata: ${p.patch.path} has changed since ${toString lockFile} was written; run hinata install";
+
       # Dependencies are linked beside the package so that relative paths from native addons to
       # sibling packages resolve.
       installMember =
@@ -124,6 +137,7 @@ let
         ''
           dest="$out${prefixOf id}/node_modules/${p.name}"
           unpackNpm ${fetchPackage p} "$dest"
+          ${lib.optionalString (p ? patch) ''patch -p1 --no-backup-if-mismatch -d "$dest" -i ${patchFile p}''}
           ${lib.concatStrings (
             lib.mapAttrsToList (alias: to: ''
               linkDep "$out${prefixOf id}" "${alias}" "${targetFrom id to}"
@@ -194,6 +208,7 @@ let
             passAsFile = [ "script" ];
             PATH = lib.makeBinPath [
               pkgs.coreutils
+              pkgs.gnupatch
               pkgs.gnutar
               pkgs.gzip
               pkgs.jq

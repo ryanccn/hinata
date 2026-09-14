@@ -64,6 +64,22 @@ Install scripts that compile against system libraries can get them from nixpkgs,
 
 When an install script fails, hinata suggests `"impure"` if the script appears to have needed the network, and `buildInputs` if it appears to have been missing a library, header or `pkg-config`.
 
+## Patches
+
+Patches listed in `patchedDependencies` are applied with `patch -p1`, as produced by `git diff`, before install scripts run. Keys are `name@version` for one version or `name` for every version, and paths are relative to the project. `hinata.lock` records a hash of each patch, so editing one rebuilds the package.
+
+```json
+{
+  "hinata": {
+    "patchedDependencies": {
+      "react@18.3.1": "patches/react.patch"
+    }
+  }
+}
+```
+
+`patchedDependencies` in `pnpm-workspace.yaml` is honored as well, and entries in `package.json` take precedence.
+
 ## Workspaces
 
 Directories matched by `packages` in `pnpm-workspace.yaml` are resolved together into one lockfile, and each gets its own `node_modules`. Dependencies on other workspace packages must use the `workspace:` protocol (`workspace:*`, `workspace:^1.0.0` or `workspace:name@*`) and are linked to their directories; other ranges always come from the registry.

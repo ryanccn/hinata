@@ -19,7 +19,7 @@ use owo_colors::colors::{Blue, Yellow};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::lock::{self, Lock};
+use crate::lock::{self, Lock, Patch};
 use crate::logging::{LogDisplay as _, plural};
 use crate::manifest::{BuildMode, Manifest};
 use crate::registry::{DEFAULT_REGISTRY, HttpRegistry};
@@ -110,7 +110,8 @@ pub fn run(options: &Options) -> Result<()> {
             {
                 return Err(error).wrap_err_with(|| format!("removing {}", key_path.display()));
             }
-            let workspace = nix::build_workspace(&lock_json, options.dev, node, &gcroot)?;
+            let workspace =
+                nix::build_workspace(&root, &lock, &lock_json, options.dev, node, &gcroot)?;
             debug!(
                 "built workspace {}",
                 workspace.display().log_display::<Blue>()
@@ -202,6 +203,7 @@ fn update_lock(
 ) -> Result<(Lock, String, &'static str)> {
     let manifest = manifest::read(root)?;
     let build_inputs = manifest.build_inputs()?;
+    let patches = manifest.patches(root)?;
     let projects = read_projects(root, &manifest)?;
     let existing = manifest::read_if_exists(lock_path)
         .wrap_err("reading hinata.lock")?
@@ -210,7 +212,7 @@ fn update_lock(
         .wrap_err("parsing hinata.lock")?;
     let pnpm_lock = match existing {
         Some(_) => None,
-        None => pnpm::read(root)?,
+        None => pnpm::read(root, &patches)?,
     };
     let from_pnpm = pnpm_lock.is_some();
     if let Update::Only(names) = &options.update
@@ -289,6 +291,8 @@ fn update_lock(
         &build_inputs,
         pnpm_only,
     );
+    mark_patches(&mut lock, &patches);
+
     let json = lock::to_json(&lock)?;
     if pnpm_only {
         return Ok((lock, json, pnpm::LOCKFILE));
@@ -353,6 +357,28 @@ fn mark_builds(
         names.join(", "),
         "hinata.allowBuilds".log_display::<Blue>()
     );
+}
+
+fn mark_patches(lock: &mut Lock, patches: &BTreeMap<String, Patch>) {
+    let mut unused: BTreeSet<&String> = patches.keys().collect();
+
+    for package in lock.packages.values_mut() {
+        let exact = format!("{}@{}", package.name, package.version);
+        package.patch = [exact, package.name.clone()]
+            .into_iter()
+            .find_map(|key| patches.get_key_value(&key))
+            .map(|(key, patch)| {
+                unused.remove(key);
+                patch.clone()
+            });
+    }
+
+    for key in unused {
+        warn!(
+            "no installed package matches {} in patchedDependencies",
+            key.log_display::<Yellow>()
+        );
+    }
 }
 
 fn write_lock(lock_path: &Path, json: &str, from_pnpm: bool) -> Result<()> {
@@ -468,10 +494,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let manifest = |range: &str| {
             format!(
-                r#"{{ "dependencies": {{ "a": "{range}", "b": "^1.0.0" }}, "devDependencies": {{ "node": "runtime:22.18.0" }}, "hinata": {{ "allowBuilds": {{ "a": true, "b": "impure" }}, "buildInputs": {{ "a": ["cairo"] }} }} }}"#
+                r#"{{ "dependencies": {{ "a": "{range}", "b": "^1.0.0" }}, "devDependencies": {{ "node": "runtime:22.18.0" }}, "hinata": {{ "allowBuilds": {{ "a": true, "b": "impure" }}, "buildInputs": {{ "a": ["cairo"] }}, "patchedDependencies": {{ "a@1.0.0": "a.patch", "a": "b.patch", "b": "b.patch" }} }} }}"#
             )
         };
         fs::write(dir.path().join("package.json"), manifest("^1.0.0")).unwrap();
+        fs::write(dir.path().join("a.patch"), "a").unwrap();
+        fs::write(dir.path().join("b.patch"), "b").unwrap();
         fs::write(
             dir.path().join(pnpm::LOCKFILE),
             "lockfileVersion: '9.0'
@@ -519,6 +547,10 @@ snapshots:
         assert!(!lock.packages["b@1.0.0"].build);
         assert!(lock.packages["b@1.0.0"].impure_build);
         assert!(!lock_path.exists());
+
+        let patch = |id: &str| lock.packages[id].patch.as_ref().unwrap().path.as_str();
+        assert_eq!(patch("a@1.0.0"), "a.patch");
+        assert_eq!(patch("b@1.0.0"), "b.patch");
 
         fs::write(dir.path().join("package.json"), manifest("^2.0.0")).unwrap();
         let error = update_lock(dir.path(), &lock_path, &options).unwrap_err();

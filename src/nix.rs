@@ -10,6 +10,7 @@ use eyre::{Result, WrapErr, bail, eyre};
 use log::debug;
 use owo_colors::colors::Blue;
 
+use crate::lock::Lock;
 use crate::logging::LogDisplay as _;
 
 pub const LIBRARY: [(&str, &str); 3] = [
@@ -30,6 +31,8 @@ pub const LIBRARY: [(&str, &str); 3] = [
 /// Nix evaluates from a temporary directory: reading a path makes it inspect the parent
 /// directories, which can be denied for protected project locations.
 pub fn build_workspace(
+    root: &Path,
+    lock: &Lock,
     lock_json: &str,
     dev: bool,
     node_major: Option<u32>,
@@ -53,6 +56,19 @@ pub fn build_workspace(
         fs::write(&path, contents).wrap_err_with(|| format!("writing {}", path.display()))?;
     }
     fs::write(dir.join("hinata.lock"), lock_json)?;
+
+    for patch in lock
+        .packages
+        .values()
+        .filter_map(|package| package.patch.as_ref())
+    {
+        let path = dir.join(&patch.path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(root.join(&patch.path), &path)
+            .wrap_err_with(|| format!("copying {}", patch.path))?;
+    }
 
     let mut command = Command::new("nix");
     command

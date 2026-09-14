@@ -46,6 +46,16 @@ pub struct Package {
     pub impure_build: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub build_inputs: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub patch: Option<Patch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Patch {
+    /// Relative to the lockfile.
+    pub path: String,
+    /// Hexadecimal SHA-256 of the patch file.
+    pub hash: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

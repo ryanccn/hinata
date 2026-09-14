@@ -10,7 +10,7 @@ use log::warn;
 use owo_colors::colors::Yellow;
 use serde::Deserialize;
 
-use crate::lock::{self, Lock, Specifiers};
+use crate::lock::{self, Lock, Patch, Specifiers};
 use crate::logging::LogDisplay as _;
 use crate::registry::{DEFAULT_REGISTRY, Registry};
 use crate::{manifest, resolve};
@@ -76,14 +76,27 @@ struct Snapshot {
 }
 
 /// Leaves `install_script` unset, since pnpm lockfiles do not record it.
-pub fn read(root: &Path) -> Result<Option<Lock>> {
+pub fn read(root: &Path, patches: &BTreeMap<String, Patch>) -> Result<Option<Lock>> {
     let path = root.join(LOCKFILE);
     let Some(source) =
         manifest::read_if_exists(&path).wrap_err_with(|| format!("reading {}", path.display()))?
     else {
         return Ok(None);
     };
-    parse(&source)
+    let pnpm = document(&source).wrap_err_with(|| format!("parsing {}", path.display()))?;
+
+    // Patches configured only where hinata does not look would otherwise be silently skipped.
+    if let Some(key) = pnpm
+        .patched_dependencies
+        .keys()
+        .find(|key| !patches.contains_key(*key))
+    {
+        bail!(
+            "{key} is patched in {LOCKFILE}, but not in patchedDependencies of pnpm-workspace.yaml or hinata.patchedDependencies in package.json"
+        );
+    }
+
+    convert(pnpm)
         .map(Some)
         .wrap_err_with(|| format!("parsing {}", path.display()))
 }
@@ -135,7 +148,7 @@ pub fn fill_install_scripts(lock: &mut Lock, registry: &dyn Registry) -> Result<
     Ok(())
 }
 
-fn parse(source: &str) -> Result<Lock> {
+fn document(source: &str) -> Result<PnpmLock> {
     // pnpm can write other documents before the one describing the project.
     let document = serde_yaml::Deserializer::from_str(source)
         .map(serde_yaml::Value::deserialize)
@@ -149,14 +162,10 @@ fn parse(source: &str) -> Result<Lock> {
     if version != "9.0" {
         bail!("lockfileVersion {version} is not supported; only 9.0 is");
     }
-    convert(serde_yaml::from_value(document)?)
+    Ok(serde_yaml::from_value(document)?)
 }
 
 fn convert(pnpm: PnpmLock) -> Result<Lock> {
-    if let Some(name) = pnpm.patched_dependencies.keys().next() {
-        bail!("{name} is patched, which is not supported yet");
-    }
-
     let mut packages = BTreeMap::new();
     for (id, snapshot) in pnpm.snapshots {
         let key = id.split_once('(').map_or(id.as_str(), |(key, _)| key);
@@ -202,6 +211,7 @@ fn convert(pnpm: PnpmLock) -> Result<Lock> {
             build: false,
             impure_build: false,
             build_inputs: Vec::new(),
+            patch: None,
         };
         packages.insert(id, package);
     }
@@ -297,9 +307,15 @@ fn unscoped(name: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
     use crate::registry::Packument;
     use serde_json::json;
+
+    fn parse(source: &str) -> Result<Lock> {
+        convert(document(source)?)
+    }
 
     const LOCKFILE_V9: &str = "lockfileVersion: '9.0'
 
@@ -481,11 +497,28 @@ snapshots:
                 .to_string()
                 .contains("not from a registry")
         );
+    }
 
-        let patched = format!(
-            "{LOCKFILE_V9}\npatchedDependencies:\n  react: {{hash: abc, path: patches/react.patch}}\n"
-        );
-        assert!(parse(&patched).unwrap_err().to_string().contains("patched"));
+    #[test]
+    fn requires_pnpm_patches_to_be_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(LOCKFILE),
+            format!("{LOCKFILE_V9}\npatchedDependencies:\n  react@18.3.1: abc\n"),
+        )
+        .unwrap();
+
+        let error = read(dir.path(), &BTreeMap::new()).unwrap_err();
+        assert!(error.to_string().contains("patchedDependencies"), "{error}");
+
+        let patches = BTreeMap::from([(
+            "react@18.3.1".to_string(),
+            Patch {
+                path: "react.patch".to_string(),
+                hash: "abc".to_string(),
+            },
+        )]);
+        assert!(read(dir.path(), &patches).unwrap().is_some());
     }
 
     struct MemoryRegistry;

@@ -5,14 +5,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use eyre::{Result, WrapErr, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::ser::PrettyFormatter;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
-use crate::lock::Specifiers;
+use crate::install::hex;
+use crate::lock::{Patch, Specifiers};
 use crate::resolve::Project;
 
 #[derive(Deserialize)]
@@ -36,6 +38,8 @@ struct HinataConfig {
     allow_builds: AllowBuilds,
     #[serde(default)]
     build_inputs: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    patched_dependencies: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -76,6 +80,8 @@ struct PnpmWorkspace {
     allow_builds: BTreeMap<String, bool>,
     #[serde(default)]
     build_inputs: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    patched_dependencies: BTreeMap<String, String>,
 }
 
 impl Manifest {
@@ -161,6 +167,31 @@ impl Manifest {
         }
 
         Ok(inputs)
+    }
+
+    /// Keyed by `name@version` or `name`.
+    pub fn patches(&self, root: &Path) -> Result<BTreeMap<String, Patch>> {
+        let mut paths = self.workspace.patched_dependencies.clone();
+        paths.extend(self.hinata.patched_dependencies.clone());
+
+        paths
+            .into_iter()
+            .map(|(key, path)| {
+                let inside = Path::new(&path)
+                    .components()
+                    .all(|component| matches!(component, Component::Normal(_) | Component::CurDir));
+                if !inside {
+                    bail!("the patch {path} for {key} must be a relative path inside the project");
+                }
+
+                let file = root.join(&path);
+                let contents =
+                    fs::read(&file).wrap_err_with(|| format!("reading {}", file.display()))?;
+                let hash = hex(Sha256::digest(contents));
+
+                Ok((key, Patch { path, hash }))
+            })
+            .collect()
     }
 }
 
@@ -454,7 +485,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             dir.path().join("package.json"),
-            r#"{ "hinata": { "allowBuilds": ["a", "b"], "buildInputs": { "a": ["cairo", "xorg.libX11"], "b": [] } } }"#,
+            r#"{ "hinata": { "allowBuilds": ["a", "b"], "buildInputs": { "a": ["cairo"], "b": [] } } }"#,
         )
         .unwrap();
         fs::write(
@@ -465,10 +496,7 @@ mod tests {
 
         assert_eq!(
             read(dir.path()).unwrap().build_inputs().unwrap(),
-            BTreeMap::from([(
-                "a".to_string(),
-                vec!["cairo".to_string(), "xorg.libX11".to_string()]
-            )])
+            BTreeMap::from([("a".to_string(), vec!["cairo".to_string()])])
         );
 
         for (config, message) in [
@@ -485,6 +513,52 @@ mod tests {
             let error = read(dir.path()).unwrap().build_inputs().unwrap_err();
             assert!(error.to_string().contains(message), "{error}");
         }
+    }
+
+    #[test]
+    fn reads_patches_from_hinata_and_pnpm_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("patches")).unwrap();
+        fs::write(dir.path().join("patches/a.patch"), "a").unwrap();
+        fs::write(dir.path().join("patches/b.patch"), "b").unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{ "hinata": { "patchedDependencies": { "a@1.0.0": "patches/a.patch" } } }"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("pnpm-workspace.yaml"),
+            "patchedDependencies:\n  a@1.0.0: patches/b.patch\n  b: ./patches/b.patch\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            read(dir.path()).unwrap().patches(dir.path()).unwrap(),
+            BTreeMap::from([
+                (
+                    "a@1.0.0".to_string(),
+                    Patch {
+                        path: "patches/a.patch".to_string(),
+                        hash: hex(Sha256::digest("a")),
+                    }
+                ),
+                (
+                    "b".to_string(),
+                    Patch {
+                        path: "./patches/b.patch".to_string(),
+                        hash: hex(Sha256::digest("b")),
+                    }
+                ),
+            ])
+        );
+
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{ "hinata": { "patchedDependencies": { "a": "../a.patch" } } }"#,
+        )
+        .unwrap();
+        let error = read(dir.path()).unwrap().patches(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("inside the project"), "{error}");
     }
 
     #[test]

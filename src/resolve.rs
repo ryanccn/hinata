@@ -838,6 +838,7 @@ fn build_packages(
                 build: false,
                 impure_build: false,
                 build_inputs: Vec::new(),
+                patch: None,
             },
         );
     }
