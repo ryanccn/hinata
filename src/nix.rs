@@ -12,6 +12,7 @@ use log::debug;
 use owo_colors::colors::Blue;
 use serde::Deserialize;
 use serde_json::Value;
+use tempfile::TempDir;
 
 use crate::lock::{self, Lock};
 use crate::logging::LogDisplay as _;
@@ -28,17 +29,46 @@ pub const LIBRARY: [(&str, &str); 3] = [
         "nix_support/hinata.sh",
         include_str!("./nix_support/hinata.sh"),
     ),
-    (
-        "nix_support/install.nix",
-        include_str!("./nix_support/install.nix"),
-    ),
+    ("flake.nix", include_str!("./nix_support/flake.nix")),
 ];
 
 /// `builtins.fetchTree` needs the flakes feature.
 const FEATURES: [&str; 2] = ["--extra-experimental-features", "nix-command flakes"];
 
-/// Nix evaluates from a temporary directory: reading a path makes it inspect the parent
-/// directories, which can be denied for protected project locations.
+/// Import from derivation would let Nixpkgs code read what it builds during evaluation, and each
+/// generated flake would leave a cached evaluation behind that is never used again.
+const PURE: [&str; 4] = [
+    "--no-eval-cache",
+    "--option",
+    "allow-import-from-derivation",
+    "false",
+];
+
+/// Flakes are evaluated purely, so Nixpkgs chosen by the project cannot read files or the
+/// environment.
+fn flake(options: &Value) -> Result<(TempDir, PathBuf)> {
+    let scratch = tempfile::Builder::new()
+        .prefix("hinata-")
+        .tempdir()
+        .wrap_err("creating a temporary directory")?;
+    let dir = fs::canonicalize(scratch.path())?;
+
+    for (path, contents) in LIBRARY {
+        let path = dir.join(path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, contents).wrap_err_with(|| format!("writing {}", path.display()))?;
+    }
+    fs::write(dir.join("options.json"), serde_json::to_vec(options)?)?;
+
+    Ok((scratch, dir))
+}
+
+fn installable(dir: &Path, attr: &str) -> String {
+    format!("path:{}#{attr}", dir.display())
+}
+
 pub fn build_workspace(
     root: &Path,
     lock: &Lock,
@@ -48,23 +78,21 @@ pub fn build_workspace(
     substituters: &BTreeMap<String, String>,
     out_link: &Path,
 ) -> Result<PathBuf> {
-    let scratch = tempfile::Builder::new()
-        .prefix("hinata-")
-        .tempdir()
-        .wrap_err("creating a temporary directory")?;
-    let dir = fs::canonicalize(scratch.path())?;
+    let nixpkgs = lock
+        .nixpkgs
+        .as_ref()
+        .ok_or_else(|| eyre!("hinata.lock has no locked Nixpkgs"))?;
+    let (_scratch, dir) = flake(&serde_json::json!({
+        "nixpkgs": nixpkgs.locked,
+        "dev": dev,
+        "nodeMajor": node_major,
+    }))?;
+
     debug!(
         "evaluating from {}{}",
         dir.display().log_display::<Blue>(),
         node_major.map_or_else(String::new, |major| format!(" for Node.js {major}"))
     );
-    for (path, contents) in LIBRARY {
-        let path = dir.join(path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&path, contents).wrap_err_with(|| format!("writing {}", path.display()))?;
-    }
     fs::write(dir.join("hinata.lock"), lock_json)?;
 
     for patch in lock
@@ -85,15 +113,10 @@ pub fn build_workspace(
         .current_dir(&dir)
         .arg("build")
         .args(FEATURES)
-        .args(["--impure", "--print-out-paths", "--out-link"])
+        .args(PURE)
+        .args(["--print-out-paths", "--out-link"])
         .arg(out_link)
-        .arg("--file")
-        .arg(dir.join("nix_support/install.nix"))
-        .args(["--arg", "dev", if dev { "true" } else { "false" }]);
-
-    if let Some(major) = node_major {
-        command.args(["--arg", "nodeMajor", &major.to_string()]);
-    }
+        .arg(installable(&dir, "workspace"));
 
     // Nix ignores these, with a warning, unless the user is trusted or they are trusted substituters.
     if !substituters.is_empty() {
@@ -153,12 +176,14 @@ pub fn lock_nixpkgs(flake_ref: &str) -> Result<lock::Nixpkgs> {
 
 /// Versions of Node.js in `nixpkgs`, keyed by attribute.
 pub fn node_versions(nixpkgs: &lock::Nixpkgs) -> Result<BTreeMap<String, String>> {
+    let (_scratch, dir) = flake(&serde_json::json!({ "nixpkgs": nixpkgs.locked }))?;
+
     let output = Command::new("nix")
-        .current_dir(std::env::temp_dir())
-        .args(["eval", "--impure", "--json"])
+        .current_dir(&dir)
+        .args(["eval", "--json"])
         .args(FEATURES)
-        .args(["--expr", include_str!("./nix_support/nodejs.nix")])
-        .env("HINATA_NIXPKGS", serde_json::to_string(&nixpkgs.locked)?)
+        .args(PURE)
+        .arg(installable(&dir, "nodeVersions"))
         .stdin(Stdio::null())
         .stderr(Stdio::inherit())
         .output()
