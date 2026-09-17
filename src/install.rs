@@ -351,7 +351,8 @@ fn update_lock(
                     "looking up install scripts in {}",
                     DEFAULT_REGISTRY.log_display::<Blue>()
                 );
-                pnpm::fill_install_scripts(&mut lock, &HttpRegistry::new(DEFAULT_REGISTRY)?)?;
+                let registry = HttpRegistry::new(DEFAULT_REGISTRY, None)?;
+                pnpm::fill_install_scripts(&mut lock, &registry)?;
                 (lock, false)
             } else {
                 debug!(
@@ -382,8 +383,9 @@ fn update_lock(
                         .collect()
                 })
                 .unwrap_or_default();
-            let registry = HttpRegistry::new(DEFAULT_REGISTRY)?;
-            let lock = resolve::resolve(&projects, &registry, &preferred)?;
+            let cutoff = resolve::release_cutoff(manifest.minimum_release_age());
+            let registry = HttpRegistry::new(DEFAULT_REGISTRY, cutoff)?;
+            let lock = resolve::resolve(&projects, &registry, &preferred, cutoff)?;
             info!(
                 "resolved {}",
                 plural(lock.packages.len(), "package", "packages")

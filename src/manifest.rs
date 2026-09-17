@@ -64,6 +64,7 @@ struct HinataConfig {
     #[serde(default)]
     substituters: BTreeMap<String, String>,
     nixpkgs: Option<String>,
+    minimum_release_age: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -226,6 +227,11 @@ impl Manifest {
     /// The flake reference to lock Nixpkgs from.
     pub fn nixpkgs(&self) -> Option<&str> {
         self.hinata.nixpkgs.as_deref()
+    }
+
+    /// In minutes, how long ago newly chosen versions must have been published.
+    pub fn minimum_release_age(&self) -> u64 {
+        self.hinata.minimum_release_age.unwrap_or(24 * 60)
     }
 
     /// The version range of Node.js in `devEngines.runtime`.

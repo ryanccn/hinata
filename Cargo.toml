@@ -9,6 +9,7 @@ edition = "2024"
 
 [dependencies]
 anstream = "1"
+chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 color-eyre = "0.6"
 eyre = "0.6"

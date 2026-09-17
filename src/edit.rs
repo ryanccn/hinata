@@ -6,16 +6,16 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
-use eyre::{Result, bail, eyre};
+use eyre::{Result, bail};
 use log::{debug, info, warn};
 use node_semver::Range;
 use owo_colors::colors::Blue;
 
 use crate::install::{self, Update};
 use crate::logging::{LogDisplay as _, plural};
-use crate::manifest::{Document, Group};
+use crate::manifest::{self, Document, Group};
 use crate::registry::{DEFAULT_REGISTRY, HttpRegistry, Registry};
-use crate::resolve;
+use crate::resolve::{self, Fetched};
 
 #[derive(Debug, PartialEq)]
 struct PackageArg {
@@ -39,6 +39,7 @@ pub fn add(dir: &Path, packages: &[String], group: Group, exact: bool, trust: bo
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
+    let cutoff = resolve::release_cutoff(manifest::read(&root)?.minimum_release_age());
     let packuments: HashMap<_, _> = if lookups.is_empty() {
         HashMap::new()
     } else {
@@ -46,7 +47,10 @@ pub fn add(dir: &Path, packages: &[String], group: Group, exact: bool, trust: bo
             "looking up tagged versions of {} in the registry",
             plural(lookups.len(), "package", "packages")
         );
-        let fetched = HttpRegistry::new(DEFAULT_REGISTRY)?.fetch(&lookups)?;
+        let fetched = HttpRegistry::new(DEFAULT_REGISTRY, cutoff)?.fetch(&lookups)?;
+        let fetched = fetched
+            .into_iter()
+            .map(|packument| Fetched::new(packument, true));
         lookups.into_iter().zip(fetched).collect()
     };
 
@@ -55,12 +59,9 @@ pub fn add(dir: &Path, packages: &[String], group: Group, exact: bool, trust: bo
             Some(range) if !is_tag(range) => range.clone(),
             tag => {
                 let tag = tag.as_deref().unwrap_or("latest");
-                let version = packuments[&arg.name]
-                    .dist_tags
-                    .get(tag)
-                    .ok_or_else(|| eyre!("{} has no version tagged {tag}", arg.name))?;
+                let version = packuments[&arg.name].tagged(&arg.name, tag, cutoff)?;
                 if exact {
-                    version.clone()
+                    version
                 } else {
                     format!("^{version}")
                 }

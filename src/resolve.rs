@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 
+use chrono::{DateTime, TimeDelta, Utc};
 use eyre::{Result, WrapErr, bail, eyre};
 use log::{debug, warn};
 use node_semver::{Range, Version};
@@ -30,11 +31,24 @@ type Groups = [BTreeMap<String, String>; 3];
 
 type Workspace<'p> = HashMap<&'p str, (&'p str, &'p Project)>;
 
+/// The time that newly chosen versions must have been published before, if any.
+pub fn release_cutoff(minutes: u64) -> Option<DateTime<Utc>> {
+    (minutes > 0).then(|| {
+        i64::try_from(minutes)
+            .ok()
+            .and_then(TimeDelta::try_minutes)
+            .and_then(|age| Utc::now().checked_sub_signed(age))
+            .unwrap_or(DateTime::<Utc>::MIN_UTC)
+    })
+}
+
 /// Projects are keyed by their `/`-separated path relative to the workspace root, which is `.`.
+/// Versions in `preferred` are used even if published after `cutoff`.
 pub fn resolve(
     projects: &BTreeMap<String, Project>,
     registry: &dyn Registry,
     preferred: &[(String, String)],
+    cutoff: Option<DateTime<Utc>>,
 ) -> Result<Lock> {
     let workspace = workspace_names(projects)?;
     let mut registry_specifiers = Vec::new();
@@ -47,7 +61,7 @@ pub fn resolve(
         links.push(project_links);
     }
 
-    let mut chooser = Chooser::new(registry, preferred);
+    let mut chooser = Chooser::new(registry, preferred, cutoff);
     let groups = chooser.choose_all(&registry_specifiers)?;
     let (packages, root_ids) = build_packages(&chooser.nodes, &groups)?;
     let importers = projects
@@ -167,7 +181,7 @@ struct Node {
     auto_peers: BTreeMap<String, String>,
 }
 
-struct Fetched {
+pub(crate) struct Fetched {
     packument: Packument,
     versions: BTreeMap<Version, String>,
     /// Cached packuments may predate versions and tags published since.
@@ -175,7 +189,7 @@ struct Fetched {
 }
 
 impl Fetched {
-    fn new(packument: Packument, verified: bool) -> Self {
+    pub(crate) fn new(packument: Packument, verified: bool) -> Self {
         let versions = packument
             .versions
             .keys()
@@ -192,6 +206,34 @@ impl Fetched {
         !self.packument.dist_tags.contains_key(range)
             && pinned_version(range, chosen)
                 .is_some_and(|version| self.versions.contains_key(&version))
+    }
+
+    fn released_before(&self, raw: &str, cutoff: Option<DateTime<Utc>>) -> bool {
+        cutoff.is_none_or(|cutoff| {
+            !self.packument.changed_since(cutoff)
+                || self
+                    .packument
+                    .time
+                    .get(raw)
+                    .and_then(|time| DateTime::parse_from_rfc3339(time).ok())
+                    .is_some_and(|time| time < cutoff)
+        })
+    }
+
+    /// The version `tag` points to, or the highest one below it published before `cutoff`.
+    pub(crate) fn tagged(
+        &self,
+        name: &str,
+        tag: &str,
+        cutoff: Option<DateTime<Utc>>,
+    ) -> Result<String> {
+        if !self.packument.dist_tags.contains_key(tag) {
+            bail!("{name} has no version tagged {tag}");
+        }
+
+        pick_version(self, tag, None, &|raw| self.released_before(raw, cutoff))
+            .map(|(_, raw)| raw)
+            .ok_or_else(|| eyre!("every version of {name} up to {tag} was published too recently for hinata.minimumReleaseAge"))
     }
 }
 
@@ -236,13 +278,18 @@ impl Request {
 
 struct Chooser<'r> {
     registry: &'r dyn Registry,
+    cutoff: Option<DateTime<Utc>>,
     packuments: HashMap<String, Fetched>,
     chosen: HashMap<String, BTreeSet<Version>>,
     nodes: BTreeMap<String, Node>,
 }
 
 impl<'r> Chooser<'r> {
-    fn new(registry: &'r dyn Registry, preferred: &[(String, String)]) -> Self {
+    fn new(
+        registry: &'r dyn Registry,
+        preferred: &[(String, String)],
+        cutoff: Option<DateTime<Utc>>,
+    ) -> Self {
         let mut chosen: HashMap<String, BTreeSet<Version>> = HashMap::new();
         for (name, version) in preferred {
             if let Ok(version) = Version::parse(version) {
@@ -251,6 +298,7 @@ impl<'r> Chooser<'r> {
         }
         Chooser {
             registry,
+            cutoff,
             packuments: HashMap::new(),
             chosen,
             nodes: BTreeMap::new(),
@@ -344,13 +392,24 @@ impl<'r> Chooser<'r> {
 
     fn choose(&mut self, request: &Request) -> Result<Option<String>> {
         let fetched = &self.packuments[&request.name];
-        match pick_version(fetched, &request.range, self.chosen.get(&request.name)) {
+        let chosen = self.chosen.get(&request.name);
+        let released = |raw: &str| fetched.released_before(raw, self.cutoff);
+        match pick_version(fetched, &request.range, chosen, &released) {
             Some((version, raw)) => {
                 self.chosen
                     .entry(request.name.clone())
                     .or_default()
                     .insert(version);
                 Ok(Some(format!("{}@{raw}", request.name)))
+            }
+            None if request.edge == Edge::Dependency
+                && pick_version(fetched, &request.range, chosen, &|_| true).is_some() =>
+            {
+                bail!(
+                    "every version of {} matching {} was published too recently for hinata.minimumReleaseAge",
+                    request.name,
+                    request.range
+                )
             }
             None if request.edge == Edge::Dependency => {
                 bail!("no version of {} matches {}", request.name, request.range)
@@ -477,10 +536,13 @@ fn pinned_version(range: &str, chosen: Option<&BTreeSet<Version>>) -> Option<Ver
         .cloned()
 }
 
+/// Versions not yet `chosen` must be `released`. A tag whose version is not falls back to the
+/// highest released version below it, and only to prereleases if the tagged version is one.
 fn pick_version(
     fetched: &Fetched,
     range: &str,
     chosen: Option<&BTreeSet<Version>>,
+    released: &dyn Fn(&str) -> bool,
 ) -> Option<(Version, String)> {
     let available = |version: &Version| {
         fetched
@@ -489,7 +551,15 @@ fn pick_version(
             .map(|(version, raw)| (version.clone(), raw.clone()))
     };
     if let Some(tagged) = fetched.packument.dist_tags.get(range) {
-        return available(&Version::parse(tagged).ok()?);
+        let (tagged, _) = available(&Version::parse(tagged).ok()?)?;
+        return fetched
+            .versions
+            .range(..=&tagged)
+            .rev()
+            .find(|(version, raw)| {
+                (tagged.is_prerelease() || !version.is_prerelease()) && released(raw)
+            })
+            .map(|(version, raw)| (version.clone(), raw.clone()));
     }
 
     let range = Range::parse(range).ok()?;
@@ -501,13 +571,14 @@ fn pick_version(
             .and_then(|latest| Version::parse(latest).ok())
             .filter(|latest| range.satisfies(latest))
             .and_then(|latest| available(&latest))
+            .filter(|(_, raw)| released(raw))
     };
     let highest = || {
         fetched
             .versions
             .iter()
             .rev()
-            .find(|(version, _)| range.satisfies(version))
+            .find(|(version, raw)| range.satisfies(version) && released(raw))
             .map(|(version, raw)| (version.clone(), raw.clone()))
     };
     chosen
@@ -924,6 +995,7 @@ mod tests {
             &BTreeMap::from([(".".to_string(), project)]),
             registry,
             preferred,
+            None,
         )
     }
 
@@ -1079,6 +1151,53 @@ mod tests {
                 "{spec} {locked:?}"
             );
         }
+    }
+
+    #[test]
+    fn skips_versions_published_after_the_cutoff() {
+        let cutoff = DateTime::parse_from_rfc3339("2026-01-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut registry = registry(vec![(
+            "a",
+            vec![
+                ("1.0.0", json!({})),
+                ("1.1.0-rc.1", json!({})),
+                ("1.1.0", json!({})),
+            ],
+        )]);
+        let a = registry.packuments.get_mut("a").unwrap();
+        a["modified"] = json!("2026-01-03T00:00:00Z");
+        a["time"] = json!({
+            "1.0.0": "2025-12-01T00:00:00Z",
+            "1.1.0-rc.1": "2025-12-15T00:00:00Z",
+            "1.1.0": "2026-01-03T00:00:00Z",
+        });
+        let resolve = |spec: &str, locked: &[(String, String)]| {
+            let project = Project {
+                name: None,
+                version: None,
+                specifiers: specifiers(&[("a", spec)]),
+            };
+            super::resolve(
+                &BTreeMap::from([(".".to_string(), project)]),
+                &registry,
+                locked,
+                Some(cutoff),
+            )
+            .map(|lock| lock.importers["."].dependencies["a"].clone())
+        };
+
+        assert_eq!(resolve("^1", &[]).unwrap(), "a@1.0.0");
+        assert_eq!(resolve("latest", &[]).unwrap(), "a@1.0.0");
+        let locked = [("a".to_string(), "1.1.0".to_string())];
+        assert_eq!(resolve("^1", &locked).unwrap(), "a@1.1.0");
+
+        let error = resolve("1.1.0", &[]).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("minimumReleaseAge"),
+            "{error:?}"
+        );
     }
 
     #[test]
@@ -1266,7 +1385,7 @@ mod tests {
                 project("shared", "1.2.3", &[("react-dom", "^18")]),
             ),
         ]);
-        let lock = super::resolve(&projects, &react_registry(), &[]).unwrap();
+        let lock = super::resolve(&projects, &react_registry(), &[], None).unwrap();
 
         let root = &lock.importers["."];
         assert_eq!(root.dependencies["hooks"], "hooks@1.0.0(react@18.3.1)");
@@ -1306,7 +1425,7 @@ mod tests {
                     project("shared", "1.0.0", &[]),
                 ),
             ]);
-            let error = super::resolve(&projects, &registry, &[]).unwrap_err();
+            let error = super::resolve(&projects, &registry, &[], None).unwrap_err();
             assert!(format!("{error:?}").contains(message), "{spec}: {error:?}");
         }
     }

@@ -32,6 +32,7 @@ Installing a project doesn't let it or its dependencies reach outside the Nix sa
 - Install scripts that run outside the sandbox, and binary caches that the project lists, need approval, which hinata asks for again when they change. `--trust` approves them without asking, for example in CI.
 - The Nixpkgs that a project chooses is evaluated purely, so it cannot read files outside the Nix store or the environment.
 - Package names, bins and integrity hashes in lockfiles are validated before they reach paths or build scripts.
+- Versions not already in the lockfile are only chosen once they have been published for a day, or for the number of minutes in `minimumReleaseAge` (`0` turns this off).
 
 This does not cover code that the project runs later, such as scripts run with `hinata run`, or builds when the Nix sandbox is off or unavailable, as it is by default on macOS.
 

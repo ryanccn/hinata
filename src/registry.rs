@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use chrono::{DateTime, Utc};
 use eyre::{Result, WrapErr};
 use log::debug;
 use reqwest::StatusCode;
@@ -27,6 +28,8 @@ const MAX_CONCURRENT_REQUESTS: usize = 32;
 
 const ABBREVIATED: &str =
     "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*";
+/// Unlike abbreviated packuments, these include when each version was published.
+const FULL: &str = "application/json";
 
 pub trait Registry {
     /// Returns packuments in the order of `names`.
@@ -42,9 +45,23 @@ pub trait Registry {
 pub struct Packument {
     #[serde(rename = "dist-tags", default)]
     pub dist_tags: BTreeMap<String, String>,
+    modified: Option<String>,
     /// Left unparsed: only chosen versions are read, and some old versions are malformed.
     #[serde(default)]
     pub versions: BTreeMap<String, Box<RawValue>>,
+    /// Only present in full packuments.
+    #[serde(default)]
+    pub time: BTreeMap<String, String>,
+}
+
+impl Packument {
+    /// Whether a version may have been published at or after `cutoff`.
+    pub fn changed_since(&self, cutoff: DateTime<Utc>) -> bool {
+        self.modified
+            .as_deref()
+            .and_then(|modified| DateTime::parse_from_rfc3339(modified).ok())
+            .is_none_or(|modified| modified >= cutoff)
+    }
 }
 
 #[derive(Deserialize)]
@@ -115,15 +132,18 @@ fn string_or_list<'de, D: Deserializer<'de>>(
 
 pub struct HttpRegistry {
     url: String,
+    /// Packuments changed since then are fetched in full.
+    cutoff: Option<DateTime<Utc>>,
     cache: PathBuf,
     client: reqwest::Client,
     runtime: tokio::runtime::Runtime,
 }
 
 impl HttpRegistry {
-    pub fn new(url: &str) -> Result<Self> {
+    pub fn new(url: &str, cutoff: Option<DateTime<Utc>>) -> Result<Self> {
         Ok(Self {
             url: url.trim_end_matches('/').to_string(),
+            cutoff,
             cache: install::cache_dir()?.join("metadata"),
             client: reqwest::Client::builder()
                 .user_agent(concat!("hinata/", env!("CARGO_PKG_VERSION")))
@@ -138,9 +158,9 @@ impl HttpRegistry {
 
     /// Named by a hash, since package names that differ only in case collide on case-insensitive
     /// file systems.
-    fn cache_path(&self, name: &str) -> PathBuf {
+    fn cache_path(&self, name: &str, accept: &str) -> PathBuf {
         let digest = Sha256::new()
-            .chain_update(ABBREVIATED)
+            .chain_update(accept)
             .chain_update("\n")
             .chain_update(self.packument_url(name))
             .finalize();
@@ -156,14 +176,23 @@ impl Registry for HttpRegistry {
             for (index, name) in names.iter().enumerate() {
                 let client = self.client.clone();
                 let url = self.packument_url(name);
-                let path = self.cache_path(name);
+                let abbreviated = self.cache_path(name, ABBREVIATED);
+                let full = self.cache_path(name, FULL);
+                let cutoff = self.cutoff;
                 let limit = limit.clone();
                 let name = name.clone();
                 tasks.spawn(async move {
                     let _permit = limit.acquire_owned().await?;
-                    let packument = fetch_packument(&client, &url, &path)
+                    let mut packument = fetch_packument(&client, &url, ABBREVIATED, &abbreviated)
                         .await
                         .wrap_err_with(|| format!("fetching {name} from the registry"))?;
+                    if cutoff.is_some_and(|cutoff| packument.changed_since(cutoff)) {
+                        packument = fetch_packument(&client, &url, FULL, &full)
+                            .await
+                            .wrap_err_with(|| {
+                                format!("fetching {name} in full from the registry")
+                            })?;
+                    }
                     Ok::<_, eyre::Report>((index, packument))
                 });
             }
@@ -182,8 +211,13 @@ impl Registry for HttpRegistry {
         })
     }
 
+    /// Abbreviated packuments changed since the cutoff are left out, as they cannot tell whether a
+    /// version was published before it.
     fn cached(&self, names: &[String]) -> Vec<Option<Packument>> {
-        let paths: Vec<PathBuf> = names.iter().map(|name| self.cache_path(name)).collect();
+        let paths: Vec<PathBuf> = names
+            .iter()
+            .map(|name| self.cache_path(name, ABBREVIATED))
+            .collect();
         let workers = std::thread::available_parallelism()
             .map_or(1, NonZero::get)
             .min(paths.len());
@@ -199,7 +233,14 @@ impl Registry for HttpRegistry {
                                 break loaded;
                             };
                             let packument = read_entry(path)
-                                .and_then(|(_, body)| serde_json::from_slice(&body).ok());
+                                .and_then(|(_, body)| {
+                                    serde_json::from_slice::<Packument>(&body).ok()
+                                })
+                                .filter(|packument| {
+                                    !self
+                                        .cutoff
+                                        .is_some_and(|cutoff| packument.changed_since(cutoff))
+                                });
                             if let Some(packument) = packument {
                                 loaded.push((index, packument));
                             }
@@ -221,9 +262,14 @@ impl Registry for HttpRegistry {
     }
 }
 
-async fn fetch_packument(client: &reqwest::Client, url: &str, path: &Path) -> Result<Packument> {
+async fn fetch_packument(
+    client: &reqwest::Client,
+    url: &str,
+    accept: &str,
+    path: &Path,
+) -> Result<Packument> {
     let cached = read_entry(path);
-    let mut request = client.get(url).header(ACCEPT, ABBREVIATED);
+    let mut request = client.get(url).header(ACCEPT, accept);
     if let Some((validators, _)) = &cached {
         if let Some(etag) = &validators.etag {
             request = request.header(IF_NONE_MATCH, etag);
@@ -301,11 +347,12 @@ mod tests {
 
     #[test]
     fn names_cache_entries_by_hash() {
-        let registry = HttpRegistry::new(DEFAULT_REGISTRY).unwrap();
-        let upper = registry.cache_path("@Scope/Pkg");
-        let lower = registry.cache_path("@scope/pkg");
+        let registry = HttpRegistry::new(DEFAULT_REGISTRY, None).unwrap();
+        let upper = registry.cache_path("@Scope/Pkg", ABBREVIATED);
+        let lower = registry.cache_path("@scope/pkg", ABBREVIATED);
 
         assert_ne!(upper, lower);
+        assert_ne!(lower, registry.cache_path("@scope/pkg", FULL));
         for path in [upper, lower] {
             assert_eq!(path.parent(), Some(registry.cache.as_path()));
             let name = path.file_name().unwrap().to_str().unwrap();
