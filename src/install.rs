@@ -388,6 +388,8 @@ fn update_lock(
         }
     };
 
+    lock::validate(&lock)?;
+
     mark_builds(
         &mut lock,
         &manifest.allow_builds(),

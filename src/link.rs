@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::os::unix::fs::symlink;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use eyre::{Result, WrapErr};
 use serde_json::Value;
@@ -77,6 +77,12 @@ fn bins(packages: &BTreeMap<String, PathBuf>) -> Result<BTreeMap<String, PathBuf
         };
         for (bin, file) in entries {
             let bin = bin.rsplit('/').next().unwrap_or(bin);
+            let inside = Path::new(file)
+                .components()
+                .all(|component| matches!(component, Component::Normal(_) | Component::CurDir));
+            if matches!(bin, "" | "." | "..") || !inside {
+                continue;
+            }
             bins.insert(
                 format!(".bin/{bin}"),
                 root.join(file.trim_start_matches("./")),
@@ -158,6 +164,11 @@ mod tests {
             "typescript",
             r#"{ "name": "typescript", "bin": "bin/tsc" }"#,
         );
+        let evil = package(
+            root.path(),
+            "evil",
+            r#"{ "name": "evil", "bin": { "..": "bin.js", "escape": "../../etc/passwd" } }"#,
+        );
         let dest = root.path().join("app/node_modules");
 
         let node = root.path().join("nodejs/bin/node");
@@ -168,6 +179,7 @@ mod tests {
                 ("@babel/core", &core),
                 ("vite", &vite),
                 ("typescript", &tsc),
+                ("evil", &evil),
             ]),
             Some(&node),
         )
@@ -185,6 +197,7 @@ mod tests {
             tsc.join("bin/tsc")
         );
         assert_eq!(fs::read_link(dest.join(".bin/node")).unwrap(), node);
+        assert!(fs::symlink_metadata(dest.join(".bin/escape")).is_err());
     }
 
     #[test]

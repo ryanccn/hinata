@@ -23,9 +23,13 @@ binEntries() {
     local package="$1"
     [ -f "$package/package.json" ] || return 0
     jq -r '
-    if (.bin | type) == "string" then [(.name | sub("^@[^/]+/"; "")), .bin] | @tsv
-    elif (.bin | type) == "object" then .bin | to_entries[] | [(.key | sub("^@[^/]+/"; "")), .value] | @tsv
-    else empty end' "$package/package.json"
+    if (.bin | type) == "string" then [.name, .bin]
+    elif (.bin | type) == "object" then .bin | to_entries[] | [.key, .value]
+    else empty end
+    | select(.[1] | type == "string")
+    | [((.[0] // "") | split("/") | last // ""), .[1]]
+    | select((.[0] | IN("", ".", "..") | not) and (.[1] | test("^/|(^|/)\\.\\.(/|$)") | not))
+    | @tsv' "$package/package.json"
 }
 
 markBinsExecutable() {

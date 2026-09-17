@@ -54,13 +54,37 @@ let
     && matches hostCpu (p.cpu or [ ])
     && (!platform.isLinux || matches hostLibc (p.libc or [ ]));
 
+  # Names end up in paths and build scripts.
+  validName =
+    name: builtins.match "(@[A-Za-z0-9~-][A-Za-z0-9._~-]*/)?[A-Za-z0-9~-][A-Za-z0-9._~-]*" name != null;
+
+  checkNames =
+    who: names:
+    let
+      invalid = lib.filter (name: !validName name) names;
+    in
+    if invalid == [ ] then
+      true
+    else
+      throw "hinata: ${who} depends on ${builtins.toJSON (lib.head invalid)}, which is not a valid package name";
+
+  checkPackage =
+    id: p:
+    assert checkNames id (lib.attrNames (p.deps or { }) ++ lib.attrNames (p.optionalDeps or { }));
+    if !validName p.name then
+      throw "hinata: ${id} is named ${builtins.toJSON p.name}, which is not a valid package name"
+    else if lib.hasPrefix "sha512-" p.integrity || lib.hasPrefix "sha256-" p.integrity then
+      p
+    else
+      throw "hinata: ${id} has no SHA-512 or SHA-256 integrity hash";
+
   loadLock =
     lockFile:
     let
       lock = lib.importJSON lockFile;
       packages =
         if lock.version == 1 then
-          lib.filterAttrs (_: compatible) lock.packages
+          lib.filterAttrs (_: compatible) (lib.mapAttrs checkPackage lock.packages)
         else
           throw "hinata: ${toString lockFile} has unsupported version ${toString lock.version}";
 
@@ -234,6 +258,13 @@ let
             lock.importers.${importer} or (throw "hinata: no importer ${importer} in ${toString lockFile}");
           who = "importer ${importer}";
         in
+        assert checkNames who (
+          lib.concatMap (group: lib.attrNames (imp.${group} or { })) [
+            "dependencies"
+            "devDependencies"
+            "optionalDependencies"
+          ]
+        );
         {
           dependencies = resolve who (imp.dependencies or { }) { };
           devDependencies = lib.optionalAttrs dev (resolve who (imp.devDependencies or { }) { });

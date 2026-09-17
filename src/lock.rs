@@ -138,6 +138,65 @@ pub fn to_json(lock: &Lock) -> eyre::Result<String> {
     Ok(json)
 }
 
+/// Names and aliases end up in paths and build scripts, so ones that npm would not accept are
+/// rejected, as are integrity hashes weaker than SHA-256.
+pub fn validate(lock: &Lock) -> eyre::Result<()> {
+    for (id, package) in &lock.packages {
+        if !is_valid_name(&package.name) {
+            eyre::bail!("{id} is named {:?}, which is not a valid package name", package.name);
+        }
+        if let Some(name) = package
+            .deps
+            .keys()
+            .chain(package.optional_deps.keys())
+            .find(|name| !is_valid_name(name))
+        {
+            eyre::bail!("{id} depends on {name:?}, which is not a valid package name");
+        }
+
+        if !["sha512-", "sha256-"]
+            .iter()
+            .any(|algorithm| package.integrity.starts_with(algorithm))
+        {
+            eyre::bail!("{id} has no SHA-512 or SHA-256 integrity hash");
+        }
+    }
+
+    for (path, importer) in &lock.importers {
+        if let Some(name) = importer
+            .dependencies
+            .keys()
+            .chain(importer.dev_dependencies.keys())
+            .chain(importer.optional_dependencies.keys())
+            .chain(importer.links.keys())
+            .find(|name| !is_valid_name(name))
+        {
+            eyre::bail!("importer {path} depends on {name:?}, which is not a valid package name");
+        }
+    }
+
+    Ok(())
+}
+
+/// Includes the uppercase letters that npm still allows in old package names.
+pub fn is_valid_name(name: &str) -> bool {
+    let segment = |segment: &str| {
+        !segment.is_empty()
+            && !segment.starts_with(['.', '_'])
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-._~".contains(&byte))
+    };
+
+    name.len() <= 214
+        && match name.strip_prefix('@') {
+            Some(scoped) => scoped
+                .split_once('/')
+                .is_some_and(|(scope, name)| segment(scope) && segment(name)),
+            None => segment(name),
+        }
+}
+
 pub fn find_cycles(packages: &BTreeMap<String, Package>) -> Vec<Vec<String>> {
     let mut graph = DiGraph::<&str, ()>::new();
     let nodes: HashMap<&str, _> = packages
@@ -166,4 +225,61 @@ pub fn find_cycles(packages: &BTreeMap<String, Package>) -> Vec<Vec<String>> {
         .collect();
     cycles.sort();
     cycles
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_only_npm_package_names() {
+        for name in [
+            "react",
+            "@babel/core",
+            "JSONStream",
+            "lodash.merge",
+            "a-b_c~d",
+        ] {
+            assert!(is_valid_name(name), "{name}");
+        }
+        for name in [
+            "",
+            "..",
+            "../x",
+            ".bin",
+            "_private",
+            "@scope",
+            "@scope/",
+            "@scope/a/b",
+            "a b",
+            "a\"$(id)",
+        ] {
+            assert!(!is_valid_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn rejects_unsafe_aliases_and_weak_integrity() {
+        let lock = |alias: &str, integrity: &str| -> Lock {
+            serde_json::from_value(serde_json::json!({
+                "version": VERSION,
+                "packages": {
+                    "a@1.0.0": {
+                        "name": "a",
+                        "version": "1.0.0",
+                        "url": "https://registry.test/a.tgz",
+                        "integrity": integrity,
+                        "deps": { alias: "b@1.0.0" },
+                    },
+                },
+                "sccs": [],
+                "importers": { ".": { "dependencies": { "a": "a@1.0.0" } } },
+            }))
+            .unwrap()
+        };
+
+        assert!(validate(&lock("b", "sha512-x")).is_ok());
+        assert!(validate(&lock("../b", "sha512-x")).is_err());
+        assert!(validate(&lock("b", "sha1-x")).is_err());
+    }
 }
