@@ -64,6 +64,13 @@ let
         else
           throw "hinata: ${toString lockFile} has unsupported version ${toString lock.version}";
 
+      lockedNodejs =
+        if lock ? node then
+          pkgs.${lock.node.attr}
+            or (throw "hinata: ${toString lockFile} uses ${lock.node.attr} (Node.js ${lock.node.version}), which is not in the given nixpkgs")
+        else
+          nodejs;
+
       cycleMembers = lib.listToAttrs (
         lib.concatLists (
           lib.imap0 (
@@ -179,7 +186,7 @@ let
           pkgs.runCommandCC name {
             nativeBuildInputs = [
               pkgs.jq
-              nodejs
+              lockedNodejs
               pkgs.python3
             ]
             # node-gyp on darwin needs libtool and xcrun, which the darwin stdenv lacks.
@@ -188,8 +195,8 @@ let
               pkgs.xcbuild
             ];
             buildInputs = lib.concatMap (id: map (buildInputOf id) (packages.${id}.buildInputs or [ ])) members;
-            npm_config_nodedir = nodejs;
-            nodeGyp = "${nodejs}/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js";
+            npm_config_nodedir = lockedNodejs;
+            nodeGyp = "${lockedNodejs}/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js";
           } script
         else
           # Sourcing the stdenv setup costs more than unpacking and linking most packages.
@@ -265,6 +272,7 @@ let
         importerRoots
         buildsFor
         rootOf
+        lockedNodejs
         ;
 
       nodeModulesFor =
@@ -333,6 +341,7 @@ let
         cp "$importersPath" "$out/importers.json"
         cp "$impureBuildsPath" "$out/impure-builds.json"
         cp "$buildsPath" "$out/builds.json"
+        ${lib.optionalString (loaded.lock ? node) ''ln -s ${loaded.lockedNodejs}/bin/node "$out/node"''}
       '';
 
   buildNodeApp =
@@ -345,7 +354,8 @@ let
       ...
     }@args:
     let
-      nodeModules = mkNodeModules { inherit lockFile importer; };
+      loaded = loadLock lockFile;
+      nodeModules = loaded.nodeModulesFor { inherit importer; };
     in
     pkgs.stdenv.mkDerivation (
       builtins.removeAttrs args [
@@ -355,7 +365,7 @@ let
         "distDir"
       ]
       // {
-        nativeBuildInputs = [ nodejs ] ++ nativeBuildInputs;
+        nativeBuildInputs = [ loaded.lockedNodejs ] ++ nativeBuildInputs;
 
         configurePhase =
           args.configurePhase or ''

@@ -14,8 +14,15 @@ use serde_json::Value;
 /// Makes `node_modules` a real directory of links to `packages` (alias to package directory) and
 /// their binaries. Links that already point at the right target are left in place, and
 /// dot-directories that are not links are kept.
-pub fn sync(node_modules: &Path, packages: &BTreeMap<String, PathBuf>) -> Result<()> {
+pub fn sync(
+    node_modules: &Path,
+    packages: &BTreeMap<String, PathBuf>,
+    node: Option<&Path>,
+) -> Result<()> {
     let mut wanted = bins(packages)?;
+    if let Some(node) = node {
+        wanted.insert(".bin/node".to_string(), node.to_path_buf());
+    }
     wanted.extend(
         packages
             .iter()
@@ -153,6 +160,7 @@ mod tests {
         );
         let dest = root.path().join("app/node_modules");
 
+        let node = root.path().join("nodejs/bin/node");
         sync(
             &dest,
             &packages(&[
@@ -161,6 +169,7 @@ mod tests {
                 ("vite", &vite),
                 ("typescript", &tsc),
             ]),
+            Some(&node),
         )
         .unwrap();
 
@@ -175,6 +184,7 @@ mod tests {
             fs::read_link(dest.join(".bin/typescript")).unwrap(),
             tsc.join("bin/tsc")
         );
+        assert_eq!(fs::read_link(dest.join(".bin/node")).unwrap(), node);
     }
 
     #[test]
@@ -190,11 +200,17 @@ mod tests {
         let dest = root.path().join("node_modules");
         let inode = |name: &str| fs::symlink_metadata(dest.join(name)).unwrap().ino();
 
-        sync(&dest, &packages(&[("react", &react), ("vite", &vite)])).unwrap();
+        sync(
+            &dest,
+            &packages(&[("react", &react), ("vite", &vite)]),
+            None,
+        )
+        .unwrap();
         let (react_inode, bin_inode) = (inode("react"), inode(".bin/vite"));
         sync(
             &dest,
             &packages(&[("react", &react), ("vite", &vite), ("zod", &zod)]),
+            None,
         )
         .unwrap();
 
@@ -215,7 +231,7 @@ mod tests {
         symlink("/nix/store/old", dest.join("left-pad")).unwrap();
         symlink("/nix/store/wrong", dest.join("react")).unwrap();
 
-        sync(&dest, &packages(&[("react", &react)])).unwrap();
+        sync(&dest, &packages(&[("react", &react)]), None).unwrap();
 
         assert!(dest.join(".vite/deps").is_dir());
         assert!(!dest.join("lodash").exists());
@@ -232,7 +248,7 @@ mod tests {
         let dest = root.path().join("node_modules");
         symlink(&elsewhere, &dest).unwrap();
 
-        sync(&dest, &BTreeMap::new()).unwrap();
+        sync(&dest, &BTreeMap::new(), None).unwrap();
 
         assert!(fs::symlink_metadata(&dest).unwrap().is_dir());
         assert!(elsewhere.is_dir());

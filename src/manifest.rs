@@ -18,6 +18,7 @@ use crate::lock::{Patch, Specifiers};
 use crate::resolve::Project;
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Manifest {
     pub name: Option<String>,
     pub version: Option<String>,
@@ -27,8 +28,28 @@ pub struct Manifest {
     pub scripts: BTreeMap<String, String>,
     #[serde(default)]
     hinata: HinataConfig,
+    #[serde(default)]
+    dev_engines: DevEngines,
     #[serde(skip)]
     workspace: PnpmWorkspace,
+}
+
+#[derive(Deserialize, Default)]
+struct DevEngines {
+    runtime: Option<Engines>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Engines {
+    One(Engine),
+    Many(Vec<Engine>),
+}
+
+#[derive(Deserialize)]
+struct Engine {
+    name: String,
+    version: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -205,6 +226,18 @@ impl Manifest {
     /// The flake reference to lock Nixpkgs from.
     pub fn nixpkgs(&self) -> Option<&str> {
         self.hinata.nixpkgs.as_deref()
+    }
+
+    /// The version range of Node.js in `devEngines.runtime`.
+    pub fn node(&self) -> Option<&str> {
+        let engines = match self.dev_engines.runtime.as_ref()? {
+            Engines::One(engine) => std::slice::from_ref(engine),
+            Engines::Many(engines) => engines.as_slice(),
+        };
+        engines
+            .iter()
+            .find(|engine| engine.name == "node")
+            .map(|engine| engine.version.as_deref().unwrap_or("*"))
     }
 }
 
@@ -572,6 +605,26 @@ mod tests {
         .unwrap();
         let error = read(dir.path()).unwrap().patches(dir.path()).unwrap_err();
         assert!(error.to_string().contains("inside the project"), "{error}");
+    }
+
+    #[test]
+    fn reads_node_from_dev_engines() {
+        let node = |json: &str| {
+            let manifest: Manifest = serde_json::from_str(json).unwrap();
+            manifest.node().map(str::to_owned)
+        };
+
+        assert_eq!(node("{}"), None);
+        assert_eq!(
+            node(r#"{ "devEngines": { "runtime": { "name": "node", "version": "^22.18.0" } } }"#)
+                .as_deref(),
+            Some("^22.18.0")
+        );
+        assert_eq!(
+            node(r#"{ "devEngines": { "runtime": [{ "name": "bun" }, { "name": "node" }] } }"#)
+                .as_deref(),
+            Some("*")
+        );
     }
 
     #[test]

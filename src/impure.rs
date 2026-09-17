@@ -18,7 +18,13 @@ use crate::logging::LogDisplay as _;
 
 /// Runs the install scripts of the package `name` at `dir` with the user's environment and network
 /// access. `dir` is a read-only store path, so scripts can only write outside of the package.
-pub fn run(project: &Path, name: &str, version: &str, dir: &Path) -> Result<()> {
+pub fn run(
+    project: &Path,
+    name: &str,
+    version: &str,
+    dir: &Path,
+    node: Option<&Path>,
+) -> Result<()> {
     let manifest_path = dir.join("package.json");
     let manifest: Value = serde_json::from_str(
         &fs::read_to_string(&manifest_path)
@@ -44,7 +50,7 @@ pub fn run(project: &Path, name: &str, version: &str, dir: &Path) -> Result<()> 
         .tempdir()
         .wrap_err("creating a temporary directory")?;
     let bins = scratch.path().join("node_modules");
-    link::sync(&bins, &siblings(node_modules)?)?;
+    link::sync(&bins, &siblings(node_modules)?, node)?;
     let path = std::env::var_os("PATH").unwrap_or_default();
     let path = std::env::join_paths(
         std::iter::once(bins.join(".bin")).chain(std::env::split_paths(&path)),
@@ -138,7 +144,7 @@ mod tests {
         )
         .unwrap();
 
-        run(Path::new("/project"), "@scope/pkg", "1.0.0", &package).unwrap();
+        run(Path::new("/project"), "@scope/pkg", "1.0.0", &package, None).unwrap();
 
         assert_eq!(
             fs::read_to_string(&out).unwrap(),
@@ -157,7 +163,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = run(root.path(), "pkg", "1.0.0", &package).unwrap_err();
+        let error = run(root.path(), "pkg", "1.0.0", &package, None).unwrap_err();
         assert!(
             error
                 .to_string()

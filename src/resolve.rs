@@ -69,6 +69,7 @@ pub fn resolve(
     Ok(Lock {
         version: lock::VERSION,
         nixpkgs: None,
+        node: None,
         sccs: lock::find_cycles(&packages),
         packages,
         importers,

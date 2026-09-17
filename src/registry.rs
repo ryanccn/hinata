@@ -4,7 +4,6 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write as _;
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -274,14 +273,10 @@ fn read_entry(path: &Path) -> Option<(Validators, Vec<u8>)> {
 }
 
 fn write_entry(path: &Path, validators: &Validators, body: &[u8]) -> Result<()> {
-    let dir = path.parent().expect("entries are inside the cache");
-    fs::create_dir_all(dir)?;
-    let mut file = tempfile::NamedTempFile::new_in(dir)?;
-    serde_json::to_writer(&mut file, validators)?;
-    file.write_all(b"\n")?;
-    file.write_all(body)?;
-    file.persist(path)?;
-    Ok(())
+    let mut entry = serde_json::to_vec(validators)?;
+    entry.push(b'\n');
+    entry.extend_from_slice(body);
+    install::write_atomically(path, &entry)
 }
 
 #[cfg(test)]

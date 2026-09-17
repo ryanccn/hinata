@@ -6,17 +6,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write as _};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use eyre::{Result, WrapErr, bail, eyre};
 use log::{debug, info, warn};
+use node_semver::{Range, Version};
 use owo_colors::OwoColorize as _;
 use owo_colors::colors::{Blue, Yellow};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::lock::{self, Lock, Patch};
@@ -27,20 +27,37 @@ use crate::resolve::Project;
 use crate::{impure, link, manifest, nix, pnpm, resolve};
 
 const LOCKFILE: &str = "hinata.lock";
-/// Installs from pnpm-lock.yaml have no hinata.lock to record Nixpkgs in.
-const REMEMBERED_NIXPKGS: &str = "nixpkgs.json";
+/// Installs from pnpm-lock.yaml have no hinata.lock to record Nixpkgs and Node.js in.
+const COMPAT: &str = "node_modules/.hinata.compat.json";
 /// Locked when neither hinata.nixpkgs nor flake.lock chooses Nixpkgs.
 const DEFAULT_NIXPKGS: &str = "github:NixOS/nixpkgs/nixpkgs-unstable";
+
+#[derive(Default, Serialize, Deserialize)]
+struct Compat {
+    nixpkgs: Option<lock::Nixpkgs>,
+    node: Option<lock::Node>,
+}
 
 struct NixpkgsSource<'a> {
     /// Lock again even if Nixpkgs is already locked.
     update: bool,
-    remembered: Option<lock::Nixpkgs>,
-    lock: &'a dyn Fn(&str) -> Result<lock::Nixpkgs>,
+    compat: Compat,
+    lock_nixpkgs: &'a dyn Fn(&str) -> Result<lock::Nixpkgs>,
+    node_versions: &'a dyn Fn(&lock::Nixpkgs) -> Result<BTreeMap<String, String>>,
 }
 
-fn remembered_nixpkgs(project: &Path) -> Option<lock::Nixpkgs> {
-    serde_json::from_str(&fs::read_to_string(project.join(REMEMBERED_NIXPKGS)).ok()?).ok()
+impl NixpkgsSource<'static> {
+    fn new(root: &Path, update: bool) -> Self {
+        NixpkgsSource {
+            update,
+            compat: fs::read_to_string(root.join(COMPAT))
+                .ok()
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default(),
+            lock_nixpkgs: &nix::lock_nixpkgs,
+            node_versions: &nix::node_versions,
+        }
+    }
 }
 
 pub struct Options {
@@ -93,9 +110,7 @@ pub fn run(options: &Options) -> Result<()> {
     let root = fs::canonicalize(&options.dir)
         .wrap_err_with(|| format!("opening {}", options.dir.display()))?;
     let manifest = manifest::read(&root)?;
-    let cache = cache_dir()?;
-    remove_legacy_cache(&cache);
-    prune_projects(&cache.join("projects"));
+    prune_projects(&cache_dir()?.join("projects"));
     let project = project_dir(&root)?;
 
     let (lock, lock_json, lock_file) = update_lock(
@@ -104,27 +119,15 @@ pub fn run(options: &Options) -> Result<()> {
         &root.join(LOCKFILE),
         &options.update,
         options.lockfile,
-        &NixpkgsSource {
-            update: options.update_nixpkgs,
-            remembered: remembered_nixpkgs(&project),
-            lock: &nix::lock_nixpkgs,
-        },
+        &NixpkgsSource::new(&root, options.update_nixpkgs),
     )?;
 
-    fs::create_dir_all(&project).wrap_err_with(|| format!("creating {}", project.display()))?;
-    if lock_file == pnpm::LOCKFILE {
-        let path = project.join(REMEMBERED_NIXPKGS);
-        fs::write(&path, serde_json::to_string(&lock.nixpkgs)?)
-            .wrap_err_with(|| format!("writing {}", path.display()))?;
-    }
-    let project_path = project.join("path");
-    fs::write(&project_path, root.as_os_str().as_bytes())
-        .wrap_err_with(|| format!("writing {}", project_path.display()))?;
+    write_atomically(&project.join("path"), root.as_os_str().as_bytes())?;
     let gcroot = project.join("gcroot");
     let key_path = project.join("key");
 
-    let node = native_addon_node(&root, &lock);
-    let key = cache_key(&lock_json, options.dev, node);
+    let node_major = native_addon_node(&root, &lock);
+    let key = cache_key(&lock_json, options.dev, node_major);
 
     let (workspace, built) = match cached_workspace(&key_path, &gcroot, &key) {
         Some(workspace) if !options.refresh => {
@@ -157,7 +160,7 @@ pub fn run(options: &Options) -> Result<()> {
                 &lock,
                 &lock_json,
                 options.dev,
-                node,
+                node_major,
                 manifest.substituters(),
                 &gcroot,
             )?;
@@ -169,17 +172,32 @@ pub fn run(options: &Options) -> Result<()> {
         }
     };
 
-    link_importers(&root, &lock, &workspace)?;
+    let node = lock
+        .node
+        .as_ref()
+        .map(|_| fs::canonicalize(workspace.join("node")))
+        .transpose()
+        .wrap_err("finding Node.js in the Nix build")?;
+
+    link_importers(&root, &lock, &workspace, node.as_deref())?;
+
+    if lock_file == pnpm::LOCKFILE {
+        let compat = Compat {
+            nixpkgs: lock.nixpkgs.clone(),
+            node: lock.node.clone(),
+        };
+        write_atomically(&root.join(COMPAT), &serde_json::to_vec(&compat)?)?;
+    }
 
     if built {
         let impure_builds: BTreeMap<String, PathBuf> =
             serde_json::from_str(&fs::read_to_string(workspace.join("impure-builds.json"))?)?;
         for (id, dir) in &impure_builds {
             let package = &lock.packages[id];
-            impure::run(&root, &package.name, &package.version, dir)?;
+            impure::run(&root, &package.name, &package.version, dir, node.as_deref())?;
         }
         // Written last, so that failed impure builds run again on the next install.
-        fs::write(&key_path, &key).wrap_err_with(|| format!("writing {}", key_path.display()))?;
+        write_atomically(&key_path, key.as_bytes())?;
     }
 
     info!(
@@ -207,20 +225,16 @@ pub fn current_workspace(root: &Path) -> Result<Option<PathBuf>> {
         &root.join(LOCKFILE),
         &Update::Keep,
         Lockfile::Frozen,
-        &NixpkgsSource {
-            update: false,
-            remembered: remembered_nixpkgs(&project),
-            lock: &nix::lock_nixpkgs,
-        },
+        &NixpkgsSource::new(root, false),
     )?;
 
-    let node = native_addon_node(root, &lock);
+    let node_major = native_addon_node(root, &lock);
 
     Ok([true, false].into_iter().find_map(|dev| {
         cached_workspace(
             &project.join("key"),
             &project.join("gcroot"),
-            &cache_key(&lock_json, dev, node),
+            &cache_key(&lock_json, dev, node_major),
         )
     }))
 }
@@ -231,7 +245,7 @@ fn project_dir(root: &Path) -> Result<PathBuf> {
 }
 
 fn native_addon_node(root: &Path, lock: &Lock) -> Option<u32> {
-    if !lock.packages.values().any(|package| package.build) {
+    if lock.node.is_some() || !lock.packages.values().any(|package| package.build) {
         return None;
     }
     // Native addons only load in the Node.js major version they were built for.
@@ -249,7 +263,7 @@ fn native_addon_node(root: &Path, lock: &Lock) -> Option<u32> {
     node
 }
 
-fn link_importers(root: &Path, lock: &Lock, workspace: &Path) -> Result<()> {
+fn link_importers(root: &Path, lock: &Lock, workspace: &Path, node: Option<&Path>) -> Result<()> {
     let importer_roots: BTreeMap<String, ImporterRoots> =
         serde_json::from_str(&fs::read_to_string(workspace.join("importers.json"))?)?;
     for (path, importer) in &lock.importers {
@@ -272,7 +286,7 @@ fn link_importers(root: &Path, lock: &Lock, workspace: &Path) -> Result<()> {
             plural(packages.len(), "direct dependency", "direct dependencies"),
             node_modules.display().log_display::<Blue>()
         );
-        link::sync(&node_modules, &packages)
+        link::sync(&node_modules, &packages, node)
             .wrap_err_with(|| format!("linking {}", node_modules.display()))?;
     }
     Ok(())
@@ -294,9 +308,13 @@ fn update_lock(
         .map(|json| serde_json::from_str::<Lock>(&json))
         .transpose()
         .wrap_err("parsing hinata.lock")?;
-    let (pnpm_lock, pinned) = match &existing {
-        Some(lock) => (None, lock.nixpkgs.clone()),
-        None => (pnpm::read(root, &patches)?, source.remembered.clone()),
+    let (pnpm_lock, pinned, pinned_node) = match &existing {
+        Some(lock) => (None, lock.nixpkgs.clone(), lock.node.clone()),
+        None => (
+            pnpm::read(root, &patches)?,
+            source.compat.nixpkgs.clone(),
+            source.compat.node.clone(),
+        ),
     };
     let from_pnpm = pnpm_lock.is_some();
     if let Update::Only(names) = update
@@ -378,7 +396,22 @@ fn update_lock(
     );
     mark_patches(&mut lock, &patches);
 
-    lock.nixpkgs = Some(pick_nixpkgs(root, pinned, manifest, lockfile, source)?);
+    let nixpkgs = pick_nixpkgs(root, pinned.clone(), manifest, lockfile, source)?;
+    lock.node = match (manifest.node(), pinned_node) {
+        (None, _) => None,
+        (Some(range), Some(node)) if node.from == range && pinned.as_ref() == Some(&nixpkgs) => {
+            Some(node)
+        }
+        _ if lockfile == Lockfile::Frozen => return Err(outdated_lock()),
+        (Some(range), _) => {
+            info!(
+                "choosing Node.js {} from Nixpkgs",
+                range.log_display::<Blue>()
+            );
+            Some(pick_node(range, &(source.node_versions)(&nixpkgs)?)?)
+        }
+    };
+    lock.nixpkgs = Some(nixpkgs);
 
     let json = lock::to_json(&lock)?;
     if pnpm_only {
@@ -422,9 +455,54 @@ fn pick_nixpkgs(
         _ if lockfile == Lockfile::Frozen => Err(outdated_lock()),
         _ => {
             info!("locking Nixpkgs from {}", flake_ref.log_display::<Blue>());
-            (source.lock)(flake_ref)
+            (source.lock_nixpkgs)(flake_ref)
         }
     }
+}
+
+/// Nixpkgs has few releases of each major version, so the newest release of a major version that
+/// the range allows is used when no release satisfies the range.
+fn pick_node(range: &str, available: &BTreeMap<String, String>) -> Result<lock::Node> {
+    let parsed = Range::parse(range)
+        .map_err(|error| eyre!("parsing the Node.js version {range} in devEngines: {error}"))?;
+    let mut versions: Vec<(Version, &String)> = available
+        .iter()
+        .filter_map(|(attr, version)| Some((Version::parse(version).ok()?, attr)))
+        .collect();
+    versions.sort();
+
+    let newest = |allowed: &dyn Fn(&Version) -> bool| {
+        versions.iter().rev().find(|(version, _)| allowed(version))
+    };
+    let node = |version: &Version, attr: &String| lock::Node {
+        from: range.to_string(),
+        attr: attr.clone(),
+        version: version.to_string(),
+    };
+
+    if let Some((version, attr)) = newest(&|version| parsed.satisfies(version)) {
+        return Ok(node(version, attr));
+    }
+
+    let (version, attr) = newest(&|version| {
+        Range::parse(format!("{}.x", version.major)).is_ok_and(|major| parsed.allows_any(&major))
+    })
+    .ok_or_else(|| {
+        let offered: Vec<String> = versions
+            .iter()
+            .map(|(version, _)| version.to_string())
+            .collect();
+        eyre!(
+            "the locked Nixpkgs has no Node.js for {range} (it has {}); run `hinata update --nixpkgs`, or set hinata.nixpkgs to a revision that has one",
+            offered.join(", ")
+        )
+    })?;
+    warn!(
+        "the locked Nixpkgs has no Node.js that satisfies {}, using {} instead",
+        range.log_display::<Yellow>(),
+        version.log_display::<Yellow>()
+    );
+    Ok(node(version, attr))
 }
 
 fn outdated_lock() -> eyre::Report {
@@ -537,11 +615,10 @@ fn write_lock(lock_path: &Path, json: &str, from_pnpm: bool) -> Result<()> {
     Ok(())
 }
 
-/// `DefaultHasher` output is only stable within one build of hinata.
 fn cache_key(lock_json: &str, dev: bool, node_major: Option<u32>) -> String {
-    let mut hasher = DefaultHasher::new();
-    (lock_json, dev, node_major, nix::LIBRARY).hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    let inputs = serde_json::to_vec(&(lock_json, dev, node_major, nix::LIBRARY))
+        .expect("strings, booleans and numbers serialize");
+    hex(Sha256::digest(inputs))
 }
 
 /// Runs from the project directory so that version managers select the project's Node.js.
@@ -586,13 +663,17 @@ pub(crate) fn hex(bytes: impl IntoIterator<Item = u8>) -> String {
     hex
 }
 
-fn remove_legacy_cache(cache: &Path) {
-    for name in ["gcroots", "keys"] {
-        let dir = cache.join(name);
-        if fs::remove_dir_all(&dir).is_ok() {
-            debug!("removed {}", dir.display().log_display::<Blue>());
-        }
-    }
+/// Readers never see a partially written file, even when installs run concurrently.
+pub(crate) fn write_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+    let write = || -> Result<()> {
+        let dir = path.parent().expect("written files are inside a directory");
+        fs::create_dir_all(dir)?;
+        let mut file = tempfile::NamedTempFile::new_in(dir)?;
+        file.write_all(contents)?;
+        file.persist(path)?;
+        Ok(())
+    };
+    write().wrap_err_with(|| format!("writing {}", path.display()))
 }
 
 /// Entries without a `path` file may belong to an install that is still setting them up.
@@ -636,8 +717,9 @@ mod tests {
     fn source() -> NixpkgsSource<'static> {
         NixpkgsSource {
             update: false,
-            remembered: None,
-            lock: &|from| Ok(locked_nixpkgs(from)),
+            compat: Compat::default(),
+            lock_nixpkgs: &|from| Ok(locked_nixpkgs(from)),
+            node_versions: &|_| Ok(BTreeMap::new()),
         }
     }
 
@@ -691,9 +773,12 @@ snapshots:
             &Update::Keep,
             Lockfile::Default,
             &NixpkgsSource {
-                update: false,
-                remembered: Some(locked_nixpkgs(DEFAULT_NIXPKGS)),
-                lock: &|_| unreachable!("remembered Nixpkgs is locked again"),
+                compat: Compat {
+                    nixpkgs: Some(locked_nixpkgs(DEFAULT_NIXPKGS)),
+                    node: None,
+                },
+                lock_nixpkgs: &|_| unreachable!("Nixpkgs from a compat install is locked again"),
+                ..source()
             },
         )
         .unwrap();
@@ -863,8 +948,8 @@ snapshots:
                 lockfile,
                 &NixpkgsSource {
                     update,
-                    remembered: None,
-                    lock: &lock_nixpkgs,
+                    lock_nixpkgs: &lock_nixpkgs,
+                    ..source()
                 },
             )
             .map(|(lock, _, _)| lock.nixpkgs.unwrap().locked["rev"].clone())
@@ -930,6 +1015,93 @@ snapshots:
         )
         .unwrap();
         assert_eq!(install(Lockfile::Default).unwrap(), "abc");
+    }
+
+    #[test]
+    fn picks_node_generously_from_nixpkgs() {
+        let available = BTreeMap::from([
+            ("nodejs_20".to_string(), "20.19.5".to_string()),
+            ("nodejs_22".to_string(), "22.17.1".to_string()),
+            ("nodejs_24".to_string(), "24.7.0".to_string()),
+        ]);
+        let pick = |range: &str| pick_node(range, &available).map(|node| (node.attr, node.version));
+
+        assert_eq!(pick("22").unwrap(), ("nodejs_22".into(), "22.17.1".into()));
+        assert_eq!(pick(">=20").unwrap(), ("nodejs_24".into(), "24.7.0".into()));
+        assert_eq!(
+            pick("^22.18.0").unwrap(),
+            ("nodejs_22".into(), "22.17.1".into())
+        );
+
+        let error = pick("^18.0.0").unwrap_err();
+        assert!(
+            error.to_string().contains("20.19.5, 22.17.1, 24.7.0"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn keeps_node_locked_until_its_range_or_nixpkgs_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(LOCKFILE);
+        let dev_engines = |range: &str, nixpkgs: &str| {
+            fs::write(
+                dir.path().join("package.json"),
+                format!(
+                    r#"{{ "devEngines": {{ "runtime": {{ "name": "node", "version": "{range}" }} }}, "hinata": {{ "nixpkgs": "{nixpkgs}" }} }}"#
+                ),
+            )
+            .unwrap();
+        };
+
+        let calls = Cell::new(0);
+        let node_versions = |_: &lock::Nixpkgs| {
+            calls.set(calls.get() + 1);
+            Ok(BTreeMap::from([
+                ("nodejs_22".to_string(), "22.17.1".to_string()),
+                ("nodejs_24".to_string(), "24.7.0".to_string()),
+            ]))
+        };
+        let install = |lockfile| {
+            update_lock(
+                dir.path(),
+                &manifest::read(dir.path()).unwrap(),
+                &lock_path,
+                &Update::Keep,
+                lockfile,
+                &NixpkgsSource {
+                    node_versions: &node_versions,
+                    ..source()
+                },
+            )
+            .map(|(lock, _, _)| lock.node.map(|node| node.attr))
+        };
+
+        dev_engines("22", DEFAULT_NIXPKGS);
+        assert_eq!(
+            install(Lockfile::Default).unwrap().as_deref(),
+            Some("nodejs_22")
+        );
+        assert_eq!(
+            install(Lockfile::Frozen).unwrap().as_deref(),
+            Some("nodejs_22")
+        );
+        assert_eq!(calls.get(), 1);
+
+        dev_engines("24", DEFAULT_NIXPKGS);
+        assert!(install(Lockfile::Frozen).is_err());
+        assert_eq!(
+            install(Lockfile::Default).unwrap().as_deref(),
+            Some("nodejs_24")
+        );
+        assert_eq!(calls.get(), 2);
+
+        dev_engines("24", "github:NixOS/nixpkgs/nixos-25.05");
+        assert_eq!(
+            install(Lockfile::Default).unwrap().as_deref(),
+            Some("nodejs_24")
+        );
+        assert_eq!(calls.get(), 3);
     }
 
     fn write_unpinned_lock(path: &Path) {

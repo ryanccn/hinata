@@ -27,3 +27,5 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 [lints.clippy]
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+
+too_many_lines = "allow"

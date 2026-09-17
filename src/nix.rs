@@ -151,6 +151,30 @@ pub fn lock_nixpkgs(flake_ref: &str) -> Result<lock::Nixpkgs> {
     })
 }
 
+/// Versions of Node.js in `nixpkgs`, keyed by attribute.
+pub fn node_versions(nixpkgs: &lock::Nixpkgs) -> Result<BTreeMap<String, String>> {
+    let output = Command::new("nix")
+        .current_dir(std::env::temp_dir())
+        .args(["eval", "--impure", "--json"])
+        .args(FEATURES)
+        .args(["--expr", include_str!("./nix_support/nodejs.nix")])
+        .env("HINATA_NIXPKGS", serde_json::to_string(&nixpkgs.locked)?)
+        .stdin(Stdio::null())
+        .stderr(Stdio::inherit())
+        .output()
+        .wrap_err("running nix; is it installed?")?;
+
+    if !output.status.success() {
+        bail!(
+            "listing Node.js versions in Nixpkgs from {} failed ({})",
+            nixpkgs.from,
+            output.status
+        );
+    }
+
+    serde_json::from_slice(&output.stdout).wrap_err("parsing Node.js versions in Nixpkgs")
+}
+
 #[derive(Deserialize)]
 struct FlakeLock {
     nodes: BTreeMap<String, FlakeNode>,

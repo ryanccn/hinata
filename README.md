@@ -83,6 +83,19 @@ Packages are built with the Nixpkgs revision locked in `hinata.lock`. It is lock
 }
 ```
 
+`devEngines` locks Node.js from the same revision: the newest release matching the range, or failing that, the newest in a major version it allows. It builds install scripts and is linked into `node_modules/.bin`. Otherwise, native addons are built for the `node` on `PATH`:
+
+```json
+{
+  "devEngines": {
+    "runtime": {
+      "name": "node",
+      "version": "^22.18.0"
+    }
+  }
+}
+```
+
 When an install script fails, hinata suggests `"impure"` if the script appears to have needed the network, and `buildInputs` if it appears to have been missing a library, header or `pkg-config`.
 
 Patches listed in `patchedDependencies` are applied with `patch -p1`, as produced by `git diff`, before install scripts run. Keys are `name@version` for one version or `name` for every version, and paths are relative to the project. `hinata.lock` records a hash of each patch, so editing one rebuilds the package.

@@ -14,6 +14,8 @@ pub struct Lock {
     pub version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nixpkgs: Option<Nixpkgs>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<Node>,
     pub packages: BTreeMap<String, Package>,
     /// Nix derivations cannot depend on each other cyclically, so each of these groups is built as one.
     pub sccs: Vec<Vec<String>>,
@@ -58,6 +60,15 @@ pub struct Nixpkgs {
     pub from: String,
     /// Attributes for `builtins.fetchTree`.
     pub locked: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Node {
+    /// The version range this was locked for.
+    pub from: String,
+    /// The Nixpkgs attribute that provides it.
+    pub attr: String,
+    pub version: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

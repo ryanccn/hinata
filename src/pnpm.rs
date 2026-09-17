@@ -6,12 +6,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use eyre::{Result, WrapErr, bail, eyre};
-use log::warn;
-use owo_colors::colors::Yellow;
 use serde::Deserialize;
 
 use crate::lock::{self, Lock, Patch, Specifiers};
-use crate::logging::LogDisplay as _;
 use crate::registry::{DEFAULT_REGISTRY, Registry};
 use crate::{manifest, resolve};
 
@@ -172,10 +169,6 @@ fn convert(pnpm: PnpmLock) -> Result<Lock> {
         let (name, version) =
             split_key(key).ok_or_else(|| eyre!("{id} is not a valid package id"))?;
         if version.starts_with(RUNTIME) {
-            warn!(
-                "skipping {}, which is a runtime rather than a package",
-                id.log_display::<Yellow>()
-            );
             continue;
         }
         let entry = pnpm
@@ -249,6 +242,7 @@ fn convert(pnpm: PnpmLock) -> Result<Lock> {
     Ok(Lock {
         version: lock::VERSION,
         nixpkgs: None,
+        node: None,
         sccs: lock::find_cycles(&packages),
         packages,
         importers,
