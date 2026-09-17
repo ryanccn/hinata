@@ -8,9 +8,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 
 A JavaScript package manager that builds `node_modules` with Nix.
 
-hinata resolves `package.json` against the npm registry into `hinata.lock`. Each package becomes its own Nix derivation, with its dependencies linked beside it as in pnpm's layout, and install scripts run offline in the Nix sandbox. The project's `node_modules` is a writable directory of links into the store.
-
-Install scripts only run for packages you allow, and can't reach anything outside the Nix sandbox. A package that compiles a native module is built once and reused by every project with the same version and dependencies, and the build can be pushed to a binary cache so CI and other machines never repeat it. Libraries it compiles against come from Nixpkgs instead of whatever is installed on the machine. And because the lockfile already pins everything, apps build in Nix straight from `hinata.lock`, with no dependency hash to keep updated.
+hinata resolves `package.json` against the npm registry into `hinata.lock`. Each package becomes its own Nix derivation, with its dependencies linked beside it as in pnpm's layout, and the project's `node_modules` is a writable directory of links into the store. A package with install scripts is built once and reused by every project with the same version and dependencies, and apps build in Nix straight from `hinata.lock`, with no dependency hash to keep updated.
 
 ## Usage
 
@@ -26,6 +24,17 @@ hinata push <store-uri>       # push packages built by install scripts to a bina
 hinata gc                     # remove stale GC roots and cached registry metadata
 ```
 
+## Security
+
+Installing a project doesn't let it or its dependencies reach outside the Nix sandbox without asking:
+
+- Install scripts only run for packages in `allowBuilds`, in the sandbox and without network access.
+- Install scripts that run outside the sandbox, and binary caches that the project lists, need approval, which hinata asks for again when they change. `--trust` approves them without asking, for example in CI.
+- The Nixpkgs that a project chooses is evaluated purely, so it cannot read files outside the Nix store or the environment.
+- Package names, bins and integrity hashes in lockfiles are validated before they reach paths or build scripts.
+
+This does not cover code that the project runs later, such as scripts run with `hinata run`, or builds when the Nix sandbox is off or unavailable, as it is by default on macOS.
+
 ## Projects
 
 Without a `hinata.lock`, `hinata install` installs from `pnpm-lock.yaml` (lockfile version 9.0) as long as it matches `package.json`, and leaves both files untouched. `hinata install --save-lock`, `add`, `remove` and `update` write a `hinata.lock`, which takes precedence from then on. `hinata install --frozen-lockfile` fails instead of resolving dependencies or changing `hinata.lock`.
@@ -38,16 +47,11 @@ packages:
   - "!packages/legacy"
 ```
 
-## Configuration
+hinata is configured under `hinata` in `package.json`. `allowBuilds`, `buildInputs` and `patchedDependencies` can also be set in `pnpm-workspace.yaml`, where entries in `package.json` take precedence.
 
-hinata is configured under `hinata` in `package.json`. `allowBuilds`, `buildInputs` and `patchedDependencies` can also be set in `pnpm-workspace.yaml`, and entries in `package.json` take precedence:
+## Install scripts
 
-```yaml
-allowBuilds:
-  esbuild: true
-```
-
-Install scripts only run for packages listed in `allowBuilds`. They run in the Nix sandbox, without network access. Scripts that download things, for example into `~/.cache`, can run after linking instead, outside the sandbox and against the read-only package. hinata asks before running these, and again when they change; `--trust` approves them without asking, for example in CI:
+Install scripts only run for packages listed in `allowBuilds`. Scripts that download things, for example into `~/.cache`, can run after linking instead, outside the sandbox and against the read-only package, once approved:
 
 ```json
 {
@@ -73,6 +77,22 @@ Install scripts that compile against system libraries can get them from Nixpkgs,
 }
 ```
 
+When an install script fails, hinata suggests `"impure"` if the script appears to have needed the network, and `buildInputs` if it appears to have been missing a library, header or `pkg-config`.
+
+Patches listed in `patchedDependencies` are applied with `patch -p1`, as produced by `git diff`, before install scripts run. Keys are `name@version` for one version or `name` for every version, and paths are relative to the project. `hinata.lock` records a hash of each patch, so editing one rebuilds the package.
+
+```json
+{
+  "hinata": {
+    "patchedDependencies": {
+      "react@18.3.1": "patches/react.patch"
+    }
+  }
+}
+```
+
+## Toolchain
+
 Packages are built with the Nixpkgs revision locked in `hinata.lock`. It is locked from the flake reference in `nixpkgs` if there is one, then from the `nixpkgs` input in the project's `flake.lock`, and otherwise from `nixpkgs-unstable`. A revision from `flake.lock` follows that file, and others stay the same until `hinata update --nixpkgs` locks them again:
 
 ```json
@@ -91,20 +111,6 @@ Packages are built with the Nixpkgs revision locked in `hinata.lock`. It is lock
     "runtime": {
       "name": "node",
       "version": "^22.18.0"
-    }
-  }
-}
-```
-
-When an install script fails, hinata suggests `"impure"` if the script appears to have needed the network, and `buildInputs` if it appears to have been missing a library, header or `pkg-config`.
-
-Patches listed in `patchedDependencies` are applied with `patch -p1`, as produced by `git diff`, before install scripts run. Keys are `name@version` for one version or `name` for every version, and paths are relative to the project. `hinata.lock` records a hash of each patch, so editing one rebuilds the package.
-
-```json
-{
-  "hinata": {
-    "patchedDependencies": {
-      "react@18.3.1": "patches/react.patch"
     }
   }
 }
@@ -131,7 +137,7 @@ Projects list the caches to download from in `substituters`, with their public k
 }
 ```
 
-Nix only uses these for trusted users, or when `trusted-substituters` in `nix.conf` lists them. Like impure install scripts, they need approval, or `--trust`.
+Nix only uses these for trusted users, or when `trusted-substituters` in `nix.conf` lists them, and hinata only passes them on once approved.
 
 ## Nix
 
