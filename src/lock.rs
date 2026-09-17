@@ -143,7 +143,10 @@ pub fn to_json(lock: &Lock) -> eyre::Result<String> {
 pub fn validate(lock: &Lock) -> eyre::Result<()> {
     for (id, package) in &lock.packages {
         if !is_valid_name(&package.name) {
-            eyre::bail!("{id} is named {:?}, which is not a valid package name", package.name);
+            eyre::bail!(
+                "{id} is named {:?}, which is not a valid package name",
+                package.name
+            );
         }
         if let Some(name) = package
             .deps

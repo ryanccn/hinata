@@ -47,7 +47,7 @@ allowBuilds:
   esbuild: true
 ```
 
-Install scripts only run for packages listed in `allowBuilds`. They run in the Nix sandbox, without network access. Scripts that download things, for example into `~/.cache`, can run after linking instead, outside the sandbox and against the read-only package:
+Install scripts only run for packages listed in `allowBuilds`. They run in the Nix sandbox, without network access. Scripts that download things, for example into `~/.cache`, can run after linking instead, outside the sandbox and against the read-only package. hinata asks before running these, and again when they change; `--trust` approves them without asking, for example in CI:
 
 ```json
 {
@@ -131,7 +131,7 @@ Projects list the caches to download from in `substituters`, with their public k
 }
 ```
 
-Nix only uses these for trusted users, or when `trusted-substituters` in `nix.conf` lists them.
+Nix only uses these for trusted users, or when `trusted-substituters` in `nix.conf` lists them. Like impure install scripts, they need approval, or `--trust`.
 
 ## Nix
 

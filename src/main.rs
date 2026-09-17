@@ -16,6 +16,7 @@ mod push;
 mod registry;
 mod resolve;
 mod run;
+mod trust;
 
 use std::path::PathBuf;
 use std::process::ExitStatus;
@@ -56,6 +57,9 @@ enum Command {
         /// Fail instead of resolving dependencies or changing hinata.lock
         #[arg(long, conflicts_with = "save_lock")]
         frozen_lockfile: bool,
+        /// Approve impure install scripts and binary caches from package.json without asking
+        #[arg(long)]
+        trust: bool,
     },
     /// Add dependencies to package.json and install them
     Add {
@@ -71,12 +75,18 @@ enum Command {
         /// Save the exact version rather than a ^ range
         #[arg(short = 'E', long)]
         save_exact: bool,
+        /// Approve impure install scripts and binary caches from package.json without asking
+        #[arg(long)]
+        trust: bool,
     },
     /// Remove dependencies from package.json and uninstall them
     #[command(alias = "rm")]
     Remove {
         #[arg(required = true)]
         packages: Vec<String>,
+        /// Approve impure install scripts and binary caches from package.json without asking
+        #[arg(long)]
+        trust: bool,
     },
     /// Update dependencies to the newest versions their ranges allow (all of them, unless packages or --nixpkgs are given)
     #[command(alias = "up")]
@@ -85,6 +95,9 @@ enum Command {
         /// Lock Nixpkgs again from `hinata.nixpkgs`
         #[arg(long)]
         nixpkgs: bool,
+        /// Approve impure install scripts and binary caches from package.json without asking
+        #[arg(long)]
+        trust: bool,
     },
     /// Run a package.json script
     Run {
@@ -115,13 +128,14 @@ fn main() -> Result<()> {
     color_eyre::install()?;
     let cli = Cli::parse();
     logging::init(cli.verbose)?;
-    let install = |update| install::Options {
+    let install = |update, trust| install::Options {
         dir: cli.dir.clone(),
         dev: true,
         refresh: false,
         update,
         update_nixpkgs: false,
         lockfile: Lockfile::Save,
+        trust,
     };
 
     match cli.command {
@@ -130,6 +144,7 @@ fn main() -> Result<()> {
             refresh,
             save_lock,
             frozen_lockfile,
+            trust,
         } => install::run(&install::Options {
             dev: !prod,
             refresh,
@@ -138,23 +153,28 @@ fn main() -> Result<()> {
                 (true, _) => Lockfile::Save,
                 _ => Lockfile::Default,
             },
-            ..install(Update::Keep)
+            ..install(Update::Keep, trust)
         })?,
         Command::Add {
             packages,
             save_dev,
             save_optional,
             save_exact,
+            trust,
         } => {
             let group = match (save_dev, save_optional) {
                 (true, _) => Group::Dev,
                 (_, true) => Group::Optional,
                 _ => Group::Prod,
             };
-            edit::add(&cli.dir, &packages, group, save_exact)?;
+            edit::add(&cli.dir, &packages, group, save_exact, trust)?;
         }
-        Command::Remove { packages } => edit::remove(&cli.dir, &packages)?,
-        Command::Update { packages, nixpkgs } => {
+        Command::Remove { packages, trust } => edit::remove(&cli.dir, &packages, trust)?,
+        Command::Update {
+            packages,
+            nixpkgs,
+            trust,
+        } => {
             let update = match (packages.is_empty(), nixpkgs) {
                 (true, true) => Update::Keep,
                 (true, false) => Update::All,
@@ -162,7 +182,7 @@ fn main() -> Result<()> {
             };
             install::run(&install::Options {
                 update_nixpkgs: nixpkgs,
-                ..install(update)
+                ..install(update, trust)
             })?;
         }
         Command::Run { script, args } => exit_with(run::script(&cli.dir, &script, &args)?),

@@ -24,7 +24,7 @@ struct PackageArg {
     range: Option<String>,
 }
 
-pub fn add(dir: &Path, packages: &[String], group: Group, exact: bool) -> Result<()> {
+pub fn add(dir: &Path, packages: &[String], group: Group, exact: bool, trust: bool) -> Result<()> {
     let root = fs::canonicalize(dir)?;
     let mut document = Document::open(&root)?;
     let args = packages
@@ -79,10 +79,10 @@ pub fn add(dir: &Path, packages: &[String], group: Group, exact: bool) -> Result
     }
 
     document.save()?;
-    install_or_restore(&root, &document)
+    install_or_restore(&root, &document, trust)
 }
 
-pub fn remove(dir: &Path, packages: &[String]) -> Result<()> {
+pub fn remove(dir: &Path, packages: &[String], trust: bool) -> Result<()> {
     let root = fs::canonicalize(dir)?;
     let mut document = Document::open(&root)?;
     for alias in packages {
@@ -92,10 +92,10 @@ pub fn remove(dir: &Path, packages: &[String]) -> Result<()> {
         info!("removing {}", alias.log_display::<Blue>());
     }
     document.save()?;
-    install_or_restore(&root, &document)
+    install_or_restore(&root, &document, trust)
 }
 
-fn install_or_restore(root: &Path, document: &Document) -> Result<()> {
+fn install_or_restore(root: &Path, document: &Document, trust: bool) -> Result<()> {
     let result = install::run(&install::Options {
         dir: root.to_path_buf(),
         dev: true,
@@ -103,6 +103,7 @@ fn install_or_restore(root: &Path, document: &Document) -> Result<()> {
         update: Update::Keep,
         update_nixpkgs: false,
         lockfile: install::Lockfile::Save,
+        trust,
     });
     if result.is_err() {
         document.restore()?;

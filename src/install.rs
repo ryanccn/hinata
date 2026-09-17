@@ -24,7 +24,7 @@ use crate::logging::{LogDisplay as _, plural};
 use crate::manifest::{BuildMode, Manifest};
 use crate::registry::{DEFAULT_REGISTRY, HttpRegistry};
 use crate::resolve::Project;
-use crate::{impure, link, manifest, nix, pnpm, resolve};
+use crate::{impure, link, manifest, nix, pnpm, resolve, trust};
 
 const LOCKFILE: &str = "hinata.lock";
 /// Installs from pnpm-lock.yaml have no hinata.lock to record Nixpkgs and Node.js in.
@@ -60,6 +60,7 @@ impl NixpkgsSource<'static> {
     }
 }
 
+#[expect(clippy::struct_excessive_bools)]
 pub struct Options {
     pub dir: PathBuf,
     pub dev: bool,
@@ -67,6 +68,8 @@ pub struct Options {
     pub update: Update,
     pub update_nixpkgs: bool,
     pub lockfile: Lockfile,
+    /// Approve impure builds and binary caches without asking.
+    pub trust: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -139,6 +142,7 @@ pub fn run(options: &Options) -> Result<()> {
             (workspace, false)
         }
         _ => {
+            trust::check(&project, &lock, manifest.substituters(), options.trust)?;
             info!(
                 "building {} with Nix {}",
                 plural(lock.packages.len(), "package", "packages"),
