@@ -3,11 +3,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
-use std::fmt::Write as _;
 use std::fs;
-use std::io::{ErrorKind, Write as _};
-use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+use std::io::ErrorKind;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -24,7 +22,7 @@ use crate::logging::{LogDisplay as _, plural};
 use crate::manifest::{BuildMode, Manifest};
 use crate::registry::{DEFAULT_REGISTRY, HttpRegistry};
 use crate::resolve::Project;
-use crate::{impure, link, manifest, nix, pnpm, resolve, trust};
+use crate::{impure, link, manifest, nix, pnpm, resolve, trust, util};
 
 const LOCKFILE: &str = "hinata.lock";
 /// Installs from pnpm-lock.yaml have no hinata.lock to record Nixpkgs and Node.js in.
@@ -113,8 +111,8 @@ pub fn run(options: &Options) -> Result<()> {
     let root = fs::canonicalize(&options.dir)
         .wrap_err_with(|| format!("opening {}", options.dir.display()))?;
     let manifest = manifest::read(&root)?;
-    prune_projects(&cache_dir()?.join("projects"));
-    let project = project_dir(&root)?;
+    util::prune_projects(&util::projects_dir()?);
+    let project = util::project_dir(&root)?;
 
     let (lock, lock_json, lock_file) = update_lock(
         &root,
@@ -125,7 +123,7 @@ pub fn run(options: &Options) -> Result<()> {
         &NixpkgsSource::new(&root, options.update_nixpkgs),
     )?;
 
-    write_atomically(&project.join("path"), root.as_os_str().as_bytes())?;
+    util::write_atomically(&project.join("path"), root.as_os_str().as_bytes())?;
     let gcroot = project.join("gcroot");
     let key_path = project.join("key");
 
@@ -190,7 +188,7 @@ pub fn run(options: &Options) -> Result<()> {
             nixpkgs: lock.nixpkgs.clone(),
             node: lock.node.clone(),
         };
-        write_atomically(&root.join(COMPAT), &serde_json::to_vec(&compat)?)?;
+        util::write_atomically(&root.join(COMPAT), &serde_json::to_vec(&compat)?)?;
     }
 
     if built {
@@ -201,7 +199,7 @@ pub fn run(options: &Options) -> Result<()> {
             impure::run(&root, &package.name, &package.version, dir, node.as_deref())?;
         }
         // Written last, so that failed impure builds run again on the next install.
-        write_atomically(&key_path, key.as_bytes())?;
+        util::write_atomically(&key_path, key.as_bytes())?;
     }
 
     info!(
@@ -222,7 +220,7 @@ pub fn run(options: &Options) -> Result<()> {
 /// The workspace of the last install, if it still matches the project.
 pub fn current_workspace(root: &Path) -> Result<Option<PathBuf>> {
     let manifest = manifest::read(root)?;
-    let project = project_dir(root)?;
+    let project = util::project_dir(root)?;
     let (lock, lock_json, _) = update_lock(
         root,
         &manifest,
@@ -241,11 +239,6 @@ pub fn current_workspace(root: &Path) -> Result<Option<PathBuf>> {
             &cache_key(&lock_json, dev, node_major),
         )
     }))
-}
-
-fn project_dir(root: &Path) -> Result<PathBuf> {
-    let hash = hex(Sha256::digest(root.as_os_str().as_bytes()));
-    Ok(cache_dir()?.join("projects").join(hash))
 }
 
 fn native_addon_node(root: &Path, lock: &Lock) -> Option<u32> {
@@ -626,7 +619,7 @@ fn write_lock(lock_path: &Path, json: &str, from_pnpm: bool) -> Result<()> {
 fn cache_key(lock_json: &str, dev: bool, node_major: Option<u32>) -> String {
     let inputs = serde_json::to_vec(&(lock_json, dev, node_major, nix::LIBRARY))
         .expect("strings, booleans and numbers serialize");
-    hex(Sha256::digest(inputs))
+    util::hex(Sha256::digest(inputs))
 }
 
 /// Runs from the project directory so that version managers select the project's Node.js.
@@ -652,61 +645,6 @@ fn node_major(root: &Path) -> Option<u32> {
 fn cached_workspace(key_path: &Path, gcroot: &Path, key: &str) -> Option<PathBuf> {
     let workspace = fs::read_link(gcroot).ok()?;
     (fs::read_to_string(key_path).ok()? == key && workspace.exists()).then_some(workspace)
-}
-
-/// GC roots are kept outside projects, which the Nix daemon may not be permitted to read.
-pub(crate) fn cache_dir() -> Result<PathBuf> {
-    let cache = std::env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .ok_or_else(|| eyre!("neither XDG_CACHE_HOME nor HOME is set"))?;
-    Ok(cache.join("hinata"))
-}
-
-pub(crate) fn hex(bytes: impl IntoIterator<Item = u8>) -> String {
-    let mut hex = String::new();
-    for byte in bytes {
-        write!(hex, "{byte:02x}").expect("writing to a string succeeds");
-    }
-    hex
-}
-
-/// Readers never see a partially written file, even when installs run concurrently.
-pub(crate) fn write_atomically(path: &Path, contents: &[u8]) -> Result<()> {
-    let write = || -> Result<()> {
-        let dir = path.parent().expect("written files are inside a directory");
-        fs::create_dir_all(dir)?;
-        let mut file = tempfile::NamedTempFile::new_in(dir)?;
-        file.write_all(contents)?;
-        file.persist(path)?;
-        Ok(())
-    };
-    write().wrap_err_with(|| format!("writing {}", path.display()))
-}
-
-/// Entries without a `path` file may belong to an install that is still setting them up.
-pub(crate) fn prune_projects(projects: &Path) -> usize {
-    let Ok(entries) = fs::read_dir(projects) else {
-        return 0;
-    };
-
-    let mut removed = 0;
-    for entry in entries.flatten() {
-        let Ok(project) = fs::read(entry.path().join("path")) else {
-            continue;
-        };
-        let project = PathBuf::from(OsString::from_vec(project));
-        if !project.exists() && fs::remove_dir_all(entry.path()).is_ok() {
-            removed += 1;
-            debug!(
-                "removed {} of {}, which no longer exists",
-                entry.path().display().log_display::<Blue>(),
-                project.display().log_display::<Blue>()
-            );
-        }
-    }
-
-    removed
 }
 
 #[cfg(test)]
@@ -1119,25 +1057,5 @@ snapshots:
             lock::to_json(&serde_json::from_str(unpinned).unwrap()).unwrap(),
         )
         .unwrap();
-    }
-
-    #[test]
-    fn prunes_projects_that_no_longer_exist() {
-        let cache = tempfile::tempdir().unwrap();
-        let live = tempfile::tempdir().unwrap();
-        let projects = cache.path().join("projects");
-        for (name, path) in [
-            ("live", live.path().as_os_str().as_bytes()),
-            ("gone", b"/nonexistent/hinata-project".as_slice()),
-        ] {
-            fs::create_dir_all(projects.join(name)).unwrap();
-            fs::write(projects.join(name).join("path"), path).unwrap();
-        }
-        fs::create_dir_all(projects.join("pending")).unwrap();
-
-        assert_eq!(prune_projects(&projects), 1);
-        assert!(projects.join("live").exists());
-        assert!(!projects.join("gone").exists());
-        assert!(projects.join("pending").exists());
     }
 }

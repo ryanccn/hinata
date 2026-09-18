@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::install;
+use crate::util;
 
 pub const DEFAULT_REGISTRY: &str = "https://registry.npmjs.org";
 
@@ -144,7 +144,7 @@ impl HttpRegistry {
         Ok(Self {
             url: url.trim_end_matches('/').to_string(),
             cutoff,
-            cache: install::cache_dir()?.join("metadata"),
+            cache: util::metadata_dir()?,
             client: reqwest::Client::builder()
                 .user_agent(concat!("hinata/", env!("CARGO_PKG_VERSION")))
                 .build()?,
@@ -164,7 +164,7 @@ impl HttpRegistry {
             .chain_update("\n")
             .chain_update(self.packument_url(name))
             .finalize();
-        self.cache.join(format!("{}.json", install::hex(digest)))
+        self.cache.join(format!("{}.json", util::hex(digest)))
     }
 }
 
@@ -322,7 +322,7 @@ fn write_entry(path: &Path, validators: &Validators, body: &[u8]) -> Result<()> 
     let mut entry = serde_json::to_vec(validators)?;
     entry.push(b'\n');
     entry.extend_from_slice(body);
-    install::write_atomically(path, &entry)
+    util::write_atomically(path, &entry)
 }
 
 #[cfg(test)]

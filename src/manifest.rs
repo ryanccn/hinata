@@ -13,7 +13,7 @@ use serde_json::ser::PrettyFormatter;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::install::hex;
+use crate::util::hex;
 use crate::lock::{Patch, Specifiers};
 use crate::resolve::Project;
 

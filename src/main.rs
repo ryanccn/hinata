@@ -17,6 +17,7 @@ mod registry;
 mod resolve;
 mod run;
 mod trust;
+mod util;
 
 use std::path::PathBuf;
 use std::process::ExitStatus;

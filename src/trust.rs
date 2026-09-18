@@ -13,7 +13,7 @@ use owo_colors::OwoColorize as _;
 use owo_colors::colors::{Blue, Yellow};
 use sha2::{Digest, Sha256};
 
-use crate::install::{hex, write_atomically};
+use crate::util::{hex, write_atomically};
 use crate::lock::Lock;
 use crate::logging::{self, LogDisplay as _};
 

@@ -11,19 +11,17 @@ use log::info;
 use owo_colors::OwoColorize as _;
 use owo_colors::colors::Blue;
 
-use crate::install;
 use crate::logging::{LogDisplay as _, plural};
+use crate::util;
 
 pub fn run() -> Result<()> {
-    let cache = install::cache_dir()?;
-
-    let removed = install::prune_projects(&cache.join("projects"));
+    let removed = util::prune_projects(&util::projects_dir()?);
     info!(
         "removed {} of projects that no longer exist",
         plural(removed, "GC root", "GC roots")
     );
 
-    let metadata = cache.join("metadata");
+    let metadata = util::metadata_dir()?;
     let size = dir_size(&metadata);
     if let Err(error) = fs::remove_dir_all(&metadata)
         && error.kind() != ErrorKind::NotFound
