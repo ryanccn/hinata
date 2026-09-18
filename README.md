@@ -18,6 +18,7 @@ hinata add [-D|-O|-E] <pkg>   # add dependencies and install them
 hinata remove <pkg>           # remove dependencies and uninstall them
 hinata update [pkg...]        # update dependencies within their ranges
 hinata update --nixpkgs       # lock Nixpkgs again
+hinata why <pkg>              # show the routes by which a package is installed
 hinata run <script>           # run a package.json script
 hinata exec <command>         # run a command with node_modules/.bin on PATH
 hinata push <store-uri>       # push packages built by install scripts to a binary cache

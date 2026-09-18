@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, HashMap};
 use petgraph::{algo::tarjan_scc, graph::DiGraph};
 use serde::{Deserialize, Serialize};
 
+pub const LOCKFILE: &str = "hinata.lock";
+
 pub const VERSION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]

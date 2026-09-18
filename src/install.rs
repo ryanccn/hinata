@@ -17,14 +17,13 @@ use owo_colors::colors::{Blue, Yellow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::lock::{self, Lock, Patch};
+use crate::lock::{self, LOCKFILE, Lock, Patch};
 use crate::logging::{LogDisplay as _, plural};
 use crate::manifest::{BuildMode, Manifest};
 use crate::registry::{DEFAULT_REGISTRY, HttpRegistry};
 use crate::resolve::Project;
-use crate::{impure, link, manifest, nix, pnpm, resolve, trust, util};
+use crate::{impure, link, manifest, nix, pnpm, resolve, summary, trust, util};
 
-const LOCKFILE: &str = "hinata.lock";
 /// Installs from pnpm-lock.yaml have no hinata.lock to record Nixpkgs and Node.js in.
 const COMPAT: &str = "node_modules/.hinata.compat.json";
 /// Locked when neither hinata.nixpkgs nor flake.lock chooses Nixpkgs.
@@ -332,13 +331,14 @@ fn update_lock(
             })
     };
     let keep = matches!(update, Update::Keep);
-    let (mut lock, pnpm_only) = match (existing, pnpm_lock) {
+    let before = summary::snapshot(existing.as_ref().or(pnpm_lock.as_ref()));
+    let (mut lock, pnpm_only, resolved) = match (existing, pnpm_lock) {
         (Some(lock), _) if keep && current(&lock) => {
             debug!(
                 "{} matches package.json, not resolving again",
                 LOCKFILE.log_display::<Blue>()
             );
-            (lock, false)
+            (lock, false, false)
         }
         (None, Some(mut lock)) if keep && current(&lock) => {
             if lockfile == Lockfile::Save {
@@ -348,13 +348,13 @@ fn update_lock(
                 );
                 let registry = HttpRegistry::new(DEFAULT_REGISTRY, None)?;
                 pnpm::fill_install_scripts(&mut lock, &registry)?;
-                (lock, false)
+                (lock, false, false)
             } else {
                 debug!(
                     "{} matches package.json, installing from it",
                     pnpm::LOCKFILE.log_display::<Blue>()
                 );
-                (lock, true)
+                (lock, true, false)
             }
         }
         (None, Some(_)) if lockfile != Lockfile::Save => bail!(
@@ -381,11 +381,7 @@ fn update_lock(
             let cutoff = resolve::release_cutoff(manifest.minimum_release_age());
             let registry = HttpRegistry::new(DEFAULT_REGISTRY, cutoff)?;
             let lock = resolve::resolve(&projects, &registry, &preferred, cutoff, &overrides)?;
-            info!(
-                "resolved {}",
-                plural(lock.packages.len(), "package", "packages")
-            );
-            (lock, false)
+            (lock, false, true)
         }
     };
 
@@ -398,6 +394,9 @@ fn update_lock(
         pnpm_only,
     );
     mark_patches(&mut lock, &patches);
+    if resolved {
+        summary::report(&before, &lock);
+    }
 
     let nixpkgs = pick_nixpkgs(root, pinned.clone(), manifest, lockfile, source)?;
     lock.node = match (manifest.node(), pinned_node) {

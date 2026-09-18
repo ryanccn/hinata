@@ -51,7 +51,7 @@ impl Overrides {
         Ok(Overrides { entries })
     }
 
-    /// The name and range that replace a request for `name` at `range`, if one is overridden.
+    /// What replaces a request for `name` at `range`, if an override matches it.
     pub fn applies(&self, name: &str, range: &str) -> Option<(String, String)> {
         let entry = self
             .entries

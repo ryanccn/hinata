@@ -16,8 +16,10 @@ mod push;
 mod registry;
 mod resolve;
 mod run;
+mod summary;
 mod trust;
 mod util;
+mod why;
 
 use std::path::PathBuf;
 use std::process::ExitStatus;
@@ -106,6 +108,11 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Show the routes by which a package is installed, one line each
+    Why {
+        /// Package, as name or name@version
+        package: String,
+    },
     /// Run a command with `node_modules/.bin` on PATH
     Exec {
         program: String,
@@ -187,6 +194,7 @@ fn main() -> Result<()> {
             })?;
         }
         Command::Run { script, args } => exit_with(run::script(&cli.dir, &script, &args)?),
+        Command::Why { package } => why::run(&cli.dir, &package)?,
         Command::Exec { program, args } => exit_with(run::exec(&cli.dir, &program, &args)?),
         Command::Push { store, .. } => push::run(&cli.dir, store.as_deref())?,
         Command::Gc => gc::run()?,

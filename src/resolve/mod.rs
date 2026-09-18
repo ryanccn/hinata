@@ -405,6 +405,7 @@ mod tests {
 
     #[test]
     fn overrides_what_dependencies_ask_for() {
+        // `absent` matches nothing, which is reported rather than fatal.
         let overrides = deps(&[("dep", "^2"), ("absent", "^1")]);
         let lock = resolve_overridden(
             &specifiers(&[("old", "^1")]),
@@ -416,7 +417,6 @@ mod tests {
 
         assert_eq!(lock.packages["old@1.0.0"].deps["dep"], "dep@2.0.0");
         assert!(!lock.packages.contains_key("dep@1.0.0"));
-        // An override nothing depends on is reported, not fatal.
         assert_eq!(lock.overrides, overrides);
     }
 
