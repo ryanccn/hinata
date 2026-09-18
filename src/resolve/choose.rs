@@ -57,12 +57,7 @@ impl Fetched {
     }
 
     /// The version `tag` points to, or the highest one below it published before `cutoff`.
-    pub fn tagged(
-        &self,
-        name: &str,
-        tag: &str,
-        cutoff: Option<DateTime<Utc>>,
-    ) -> Result<String> {
+    pub fn tagged(&self, name: &str, tag: &str, cutoff: Option<DateTime<Utc>>) -> Result<String> {
         if !self.packument.dist_tags.contains_key(tag) {
             bail!("{name} has no version tagged {tag}");
         }
@@ -333,8 +328,14 @@ impl<'r> Chooser<'r> {
         let mut requests = Vec::new();
         for (edge, alias, spec) in deps.chain(optional).chain(peers) {
             requests.extend(
-                Request::new(Origin::Node(key.to_string()), edge, alias, spec, self.overrides)
-                    .wrap_err_with(|| format!("in {key}"))?,
+                Request::new(
+                    Origin::Node(key.to_string()),
+                    edge,
+                    alias,
+                    spec,
+                    self.overrides,
+                )
+                .wrap_err_with(|| format!("in {key}"))?,
             );
         }
         Ok(requests)

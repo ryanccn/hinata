@@ -78,7 +78,11 @@ pub fn report(before: &Snapshot, after: &Lock) {
     );
 
     let added = changes.added.iter().map(|entry| {
-        let scripts = if entry.scripts { " (install scripts)" } else { "" };
+        let scripts = if entry.scripts {
+            " (install scripts)"
+        } else {
+            ""
+        };
         format!("{} {} {}{scripts}", "+".green(), entry.name, entry.version)
     });
     let removed = changes
@@ -151,7 +155,8 @@ fn changes(before: &Snapshot, after: &Lock) -> Changes {
         .collect();
 
     let (added_once, removed_once) = (count_by_name(&added), count_by_name(&removed));
-    let paired = |name: &str| added_once.get(name) == Some(&1) && removed_once.get(name) == Some(&1);
+    let paired =
+        |name: &str| added_once.get(name) == Some(&1) && removed_once.get(name) == Some(&1);
 
     let mut from: BTreeMap<String, String> = BTreeMap::new();
     removed.retain(|entry| {

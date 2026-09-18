@@ -13,9 +13,9 @@ use owo_colors::OwoColorize as _;
 use owo_colors::colors::{Blue, Yellow};
 use sha2::{Digest, Sha256};
 
-use crate::util::{hex, write_atomically};
 use crate::lock::Lock;
 use crate::logging::{self, LogDisplay as _};
+use crate::util::{hex, write_atomically};
 
 /// Impure install scripts run as the user, and binary caches can provide any store path, so both
 /// affect more than the project and are only used once the user has approved them. Approvals are

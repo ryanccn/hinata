@@ -745,7 +745,8 @@ mod tests {
                 project("shared", "1.2.3", &[("react-dom", "^18")]),
             ),
         ]);
-        let lock = super::resolve(&projects, &react_registry(), &[], None, &BTreeMap::new()).unwrap();
+        let lock =
+            super::resolve(&projects, &react_registry(), &[], None, &BTreeMap::new()).unwrap();
 
         let root = &lock.importers["."];
         assert_eq!(root.dependencies["hooks"], "hooks@1.0.0(react@18.3.1)");

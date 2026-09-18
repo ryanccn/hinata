@@ -13,9 +13,9 @@ use serde_json::ser::PrettyFormatter;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::util::hex;
 use crate::lock::{Patch, Specifiers};
 use crate::resolve::Project;
+use crate::util::hex;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]

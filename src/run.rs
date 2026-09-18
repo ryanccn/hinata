@@ -45,13 +45,17 @@ pub fn script(dir: &Path, name: &str, args: &[String]) -> Result<ExitStatus> {
 
 /// `pre` and `post` hooks run around the script they are named after, as in npm.
 fn chain<'s>(scripts: &'s BTreeMap<String, String>, name: &str) -> Vec<(String, &'s str)> {
-    [format!("pre{name}"), name.to_string(), format!("post{name}")]
-        .into_iter()
-        .filter_map(|event| {
-            let body = scripts.get(&event)?;
-            Some((event, body.as_str()))
-        })
-        .collect()
+    [
+        format!("pre{name}"),
+        name.to_string(),
+        format!("post{name}"),
+    ]
+    .into_iter()
+    .filter_map(|event| {
+        let body = scripts.get(&event)?;
+        Some((event, body.as_str()))
+    })
+    .collect()
 }
 
 fn script_line(event: &str, body: &str, name: &str, args: &[String]) -> String {

@@ -33,13 +33,15 @@ impl Overrides {
         for (key, spec) in config {
             let (name, selector) = match split_version(key) {
                 Some((name, range)) => {
-                    let parsed = Range::parse(range)
-                        .map_err(|error| eyre!("the override {key} is not a valid range: {error}"))?;
+                    let parsed = Range::parse(range).map_err(|error| {
+                        eyre!("the override {key} is not a valid range: {error}")
+                    })?;
                     (name, Some((range.to_string(), parsed)))
                 }
                 None => (key.as_str(), None),
             };
-            let to = parse_spec(name, spec).wrap_err_with(|| format!("in the override for {key}"))?;
+            let to =
+                parse_spec(name, spec).wrap_err_with(|| format!("in the override for {key}"))?;
             entries.push(Entry {
                 key: key.clone(),
                 name: name.to_string(),
