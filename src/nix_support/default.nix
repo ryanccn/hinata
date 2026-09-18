@@ -13,32 +13,19 @@ let
   platform = pkgs.stdenv.hostPlatform;
 
   hostOs =
-    if platform.isDarwin then
-      "darwin"
-    else if platform.isLinux then
-      "linux"
-    else if platform.isFreeBSD then
-      "freebsd"
-    else if platform.isOpenBSD then
-      "openbsd"
-    else if platform.isWindows then
-      "win32"
-    else
-      platform.parsed.kernel.name;
+    {
+      "Windows" = "win32";
+    }
+    .${platform.uname.system} or (lib.toLower platform.uname.system);
 
   hostCpu =
-    if platform.isAarch64 then
-      "arm64"
-    else if platform.isx86_64 then
-      "x64"
-    else if platform.isx86_32 then
-      "ia32"
-    else if platform.isAarch32 then
-      "arm"
-    else
-      platform.parsed.cpu.name;
-
-  hostLibc = if platform.isMusl then "musl" else "glibc";
+    {
+      "x86_64" = "x64";
+      "aarch64" = "arm64";
+      "i686" = "ia32";
+      "armv7l" = "arm";
+    }
+    .${platform.uname.processor} or platform.uname.processor;
 
   matches =
     value: allowed:
@@ -52,7 +39,7 @@ let
     p:
     matches hostOs (p.os or [ ])
     && matches hostCpu (p.cpu or [ ])
-    && (!platform.isLinux || matches hostLibc (p.libc or [ ]));
+    && (!platform.isLinux || matches platform.libc (p.libc or [ ]));
 
   # Names end up in paths and build scripts.
   validName =
