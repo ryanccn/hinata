@@ -48,7 +48,20 @@ packages:
   - "!packages/legacy"
 ```
 
-hinata is configured under `hinata` in `package.json`. `allowBuilds`, `buildInputs` and `patchedDependencies` can also be set in `pnpm-workspace.yaml`, where entries in `package.json` take precedence.
+hinata is configured under `hinata` in `package.json`. `allowBuilds`, `buildInputs`, `patchedDependencies` and `overrides` can also be set in `pnpm-workspace.yaml`, where entries in `package.json` take precedence.
+
+`overrides` replaces what dependencies ask for, whoever asks for it, keyed by a name or a name and the range to replace. A key with a range only applies to requests it overlaps, so a pin can retire itself once the ecosystem moves past it. Values are ranges, or `npm:` aliases to resolve a different package entirely:
+
+```json
+{
+  "hinata": {
+    "overrides": {
+      "semver@<7.5.2": "^7.5.2",
+      "lodash": "npm:lodash-es@^4"
+    }
+  }
+}
+```
 
 ## Install scripts
 

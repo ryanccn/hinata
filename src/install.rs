@@ -320,8 +320,10 @@ fn update_lock(
         warn_missing_updates(names, lock);
     }
 
+    let overrides = manifest.overrides();
     let current = |lock: &Lock| {
         lock.version == lock::VERSION
+            && lock.overrides == overrides
             && lock.importers.len() == projects.len()
             && projects.iter().all(|(path, project)| {
                 lock.importers.get(path).is_some_and(|importer| {
@@ -378,7 +380,7 @@ fn update_lock(
                 .unwrap_or_default();
             let cutoff = resolve::release_cutoff(manifest.minimum_release_age());
             let registry = HttpRegistry::new(DEFAULT_REGISTRY, cutoff)?;
-            let lock = resolve::resolve(&projects, &registry, &preferred, cutoff)?;
+            let lock = resolve::resolve(&projects, &registry, &preferred, cutoff, &overrides)?;
             info!(
                 "resolved {}",
                 plural(lock.packages.len(), "package", "packages")
@@ -868,6 +870,33 @@ snapshots:
         let pretty = lock::to_json(&serde_json::from_str(compact).unwrap()).unwrap();
         fs::write(&lock_path, pretty).unwrap();
         assert!(frozen().is_ok());
+    }
+
+    #[test]
+    fn resolves_again_when_overrides_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(LOCKFILE);
+        let locked = r#"{"version":1,"nixpkgs":{"from":"github:NixOS/nixpkgs/nixpkgs-unstable","locked":{"rev":"abc"}},"overrides":{"semver":"^7.5.2"},"packages":{},"sccs":[],"importers":{".":{}}}"#;
+        fs::write(
+            &lock_path,
+            lock::to_json(&serde_json::from_str(locked).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let frozen = |config: &str| {
+            fs::write(dir.path().join("package.json"), config).unwrap();
+            update_lock(
+                dir.path(),
+                &manifest::read(dir.path()).unwrap(),
+                &lock_path,
+                &Update::Keep,
+                Lockfile::Frozen,
+                &source(),
+            )
+        };
+
+        assert!(frozen(r#"{ "hinata": { "overrides": { "semver": "^7.5.2" } } }"#).is_ok());
+        assert!(frozen(r#"{ "hinata": { "overrides": { "semver": "^7.6.0" } } }"#).is_err());
+        assert!(frozen("{}").is_err());
     }
 
     #[test]

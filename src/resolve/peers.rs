@@ -264,7 +264,7 @@ impl PeerResolver<'_> {
     }
 }
 
-pub(crate) fn build_packages(
+pub fn build_packages(
     nodes: &BTreeMap<String, Node>,
     roots: &[Groups],
 ) -> Result<(BTreeMap<String, lock::Package>, Vec<Groups>)> {

@@ -17,9 +17,10 @@ use crate::lock::Specifiers;
 use crate::logging::{LogDisplay as _, plural};
 use crate::registry::{Packument, Registry, VersionManifest};
 
+use super::overrides::Overrides;
 use super::{Groups, Node, parse_spec};
 
-pub(crate) struct Fetched {
+pub struct Fetched {
     packument: Packument,
     versions: BTreeMap<Version, String>,
     /// Cached packuments may predate versions and tags published since.
@@ -27,7 +28,7 @@ pub(crate) struct Fetched {
 }
 
 impl Fetched {
-    pub(crate) fn new(packument: Packument, verified: bool) -> Self {
+    pub fn new(packument: Packument, verified: bool) -> Self {
         let versions = packument
             .versions
             .keys()
@@ -59,7 +60,7 @@ impl Fetched {
     }
 
     /// The version `tag` points to, or the highest one below it published before `cutoff`.
-    pub(crate) fn tagged(
+    pub fn tagged(
         &self,
         name: &str,
         tag: &str,
@@ -96,15 +97,24 @@ struct Request {
 }
 
 impl Request {
-    fn new(from: Origin, edge: Edge, alias: &str, spec: &str) -> Result<Option<Request>> {
+    fn new(
+        from: Origin,
+        edge: Edge,
+        alias: &str,
+        spec: &str,
+        overrides: &Overrides,
+    ) -> Result<Option<Request>> {
         match parse_spec(alias, spec) {
-            Ok((name, range)) => Ok(Some(Request {
-                from,
-                edge,
-                alias: alias.to_string(),
-                name,
-                range,
-            })),
+            Ok((name, range)) => {
+                let (name, range) = overrides.applies(&name, &range).unwrap_or((name, range));
+                Ok(Some(Request {
+                    from,
+                    edge,
+                    alias: alias.to_string(),
+                    name,
+                    range,
+                }))
+            }
             Err(error) if edge == Edge::Dependency => Err(error),
             Err(error) => {
                 warn!("skipping {}: {error}", alias.log_display::<Yellow>());
@@ -114,19 +124,21 @@ impl Request {
     }
 }
 
-pub(crate) struct Chooser<'r> {
+pub struct Chooser<'r> {
     registry: &'r dyn Registry,
     cutoff: Option<DateTime<Utc>>,
+    overrides: &'r Overrides,
     packuments: HashMap<String, Fetched>,
     chosen: HashMap<String, BTreeSet<Version>>,
-    pub(crate) nodes: BTreeMap<String, Node>,
+    pub nodes: BTreeMap<String, Node>,
 }
 
 impl<'r> Chooser<'r> {
-    pub(crate) fn new(
+    pub fn new(
         registry: &'r dyn Registry,
         preferred: &[(String, String)],
         cutoff: Option<DateTime<Utc>>,
+        overrides: &'r Overrides,
     ) -> Self {
         let mut chosen: HashMap<String, BTreeSet<Version>> = HashMap::new();
         for (name, version) in preferred {
@@ -137,20 +149,21 @@ impl<'r> Chooser<'r> {
         Chooser {
             registry,
             cutoff,
+            overrides,
             packuments: HashMap::new(),
             chosen,
             nodes: BTreeMap::new(),
         }
     }
 
-    pub(crate) fn choose_all(&mut self, importers: &[Specifiers]) -> Result<Vec<Groups>> {
+    pub fn choose_all(&mut self, importers: &[Specifiers]) -> Result<Vec<Groups>> {
         let edges = [Edge::Dependency, Edge::Dependency, Edge::Optional];
         let mut requests = Vec::new();
         for (index, specifiers) in importers.iter().enumerate() {
             for (group, (deps, edge)) in specifiers.groups().into_iter().zip(edges).enumerate() {
                 for (alias, spec) in deps {
                     let from = Origin::Importer { index, group };
-                    requests.extend(Request::new(from, edge, alias, spec)?);
+                    requests.extend(Request::new(from, edge, alias, spec, self.overrides)?);
                 }
             }
         }
@@ -323,7 +336,7 @@ impl<'r> Chooser<'r> {
         let mut requests = Vec::new();
         for (edge, alias, spec) in deps.chain(optional).chain(peers) {
             requests.extend(
-                Request::new(Origin::Node(key.to_string()), edge, alias, spec)
+                Request::new(Origin::Node(key.to_string()), edge, alias, spec, self.overrides)
                     .wrap_err_with(|| format!("in {key}"))?,
             );
         }

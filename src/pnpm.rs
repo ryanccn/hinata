@@ -27,6 +27,8 @@ struct PnpmLock {
     snapshots: BTreeMap<String, Snapshot>,
     #[serde(default)]
     patched_dependencies: BTreeMap<String, serde_yaml::Value>,
+    #[serde(default)]
+    overrides: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -243,6 +245,7 @@ fn convert(pnpm: PnpmLock) -> Result<Lock> {
         version: lock::VERSION,
         nixpkgs: None,
         node: None,
+        overrides: pnpm.overrides,
         sccs: lock::find_cycles(&packages),
         packages,
         importers,

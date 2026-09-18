@@ -7,21 +7,26 @@
 //! of resolved peers.
 
 mod choose;
+mod overrides;
 mod peers;
 
 use std::collections::{BTreeMap, HashMap};
 
 use chrono::{DateTime, TimeDelta, Utc};
 use eyre::{Result, WrapErr, bail, eyre};
+use log::warn;
 use node_semver::{Range, Version};
+use owo_colors::colors::Yellow;
 
 use crate::lock::{self, Lock, Specifiers};
+use crate::logging::LogDisplay as _;
 use crate::registry::{Registry, VersionManifest};
 
 use choose::Chooser;
+use overrides::Overrides;
 use peers::build_packages;
 
-pub(crate) use choose::Fetched;
+pub use choose::Fetched;
 
 const WORKSPACE: &str = "workspace:";
 
@@ -53,6 +58,7 @@ pub fn resolve(
     registry: &dyn Registry,
     preferred: &[(String, String)],
     cutoff: Option<DateTime<Utc>>,
+    overrides: &BTreeMap<String, String>,
 ) -> Result<Lock> {
     let workspace = workspace_names(projects)?;
     let mut registry_specifiers = Vec::new();
@@ -65,8 +71,15 @@ pub fn resolve(
         links.push(project_links);
     }
 
-    let mut chooser = Chooser::new(registry, preferred, cutoff);
+    let parsed = Overrides::new(overrides)?;
+    let mut chooser = Chooser::new(registry, preferred, cutoff, &parsed);
     let groups = chooser.choose_all(&registry_specifiers)?;
+    for key in parsed.unused() {
+        warn!(
+            "nothing depends on {}, so its override was not applied",
+            key.log_display::<Yellow>()
+        );
+    }
     let (packages, root_ids) = build_packages(&chooser.nodes, &groups)?;
     let importers = projects
         .iter()
@@ -88,6 +101,7 @@ pub fn resolve(
         version: lock::VERSION,
         nixpkgs: None,
         node: None,
+        overrides: overrides.clone(),
         sccs: lock::find_cycles(&packages),
         packages,
         importers,
@@ -185,7 +199,7 @@ struct Node {
     auto_peers: BTreeMap<String, String>,
 }
 
-pub(crate) fn parse_spec(alias: &str, spec: &str) -> Result<(String, String)> {
+pub fn parse_spec(alias: &str, spec: &str) -> Result<(String, String)> {
     let (name, range) = match spec.strip_prefix("npm:") {
         Some(target) => split_version(target).unwrap_or((target, "")),
         None => (alias, spec),
@@ -199,7 +213,7 @@ pub(crate) fn parse_spec(alias: &str, spec: &str) -> Result<(String, String)> {
 }
 
 /// Splits `name@version`, where `name` may be scoped.
-pub(crate) fn split_version(spec: &str) -> Option<(&str, &str)> {
+pub fn split_version(spec: &str) -> Option<(&str, &str)> {
     let at = spec.get(1..)?.find('@')? + 1;
     Some((&spec[..at], &spec[at + 1..]))
 }
@@ -273,6 +287,15 @@ mod tests {
         registry: &dyn Registry,
         preferred: &[(String, String)],
     ) -> Result<Lock> {
+        resolve_overridden(specifiers, registry, preferred, &BTreeMap::new())
+    }
+
+    fn resolve_overridden(
+        specifiers: &Specifiers,
+        registry: &dyn Registry,
+        preferred: &[(String, String)],
+        overrides: &BTreeMap<String, String>,
+    ) -> Result<Lock> {
         let project = Project {
             name: None,
             version: None,
@@ -283,6 +306,7 @@ mod tests {
             registry,
             preferred,
             None,
+            overrides,
         )
     }
 
@@ -360,6 +384,54 @@ mod tests {
         assert!(a.has_bin);
         assert!(lock.packages["b@1.5.0"].install_script);
         assert_eq!(lock.packages.len(), 2);
+    }
+
+    fn override_registry() -> MemoryRegistry {
+        registry(vec![
+            (
+                "old",
+                vec![("1.0.0", json!({ "dependencies": { "dep": "^1" } }))],
+            ),
+            (
+                "dep",
+                vec![
+                    ("1.0.0", json!({})),
+                    ("2.0.0", json!({})),
+                    ("3.0.0", json!({})),
+                ],
+            ),
+        ])
+    }
+
+    #[test]
+    fn overrides_what_dependencies_ask_for() {
+        let overrides = deps(&[("dep", "^2"), ("absent", "^1")]);
+        let lock = resolve_overridden(
+            &specifiers(&[("old", "^1")]),
+            &override_registry(),
+            &[],
+            &overrides,
+        )
+        .unwrap();
+
+        assert_eq!(lock.packages["old@1.0.0"].deps["dep"], "dep@2.0.0");
+        assert!(!lock.packages.contains_key("dep@1.0.0"));
+        // An override nothing depends on is reported, not fatal.
+        assert_eq!(lock.overrides, overrides);
+    }
+
+    #[test]
+    fn overrides_only_the_ranges_a_selector_matches() {
+        let lock = resolve_overridden(
+            &specifiers(&[("old", "^1"), ("dep", "^3")]),
+            &override_registry(),
+            &[],
+            &deps(&[("dep@^1", "^2")]),
+        )
+        .unwrap();
+
+        assert_eq!(lock.packages["old@1.0.0"].deps["dep"], "dep@2.0.0");
+        assert_eq!(lock.importers["."].dependencies["dep"], "dep@3.0.0");
     }
 
     #[test]
@@ -471,6 +543,7 @@ mod tests {
                 &registry,
                 locked,
                 Some(cutoff),
+                &BTreeMap::new(),
             )
             .map(|lock| lock.importers["."].dependencies["a"].clone())
         };
@@ -672,7 +745,7 @@ mod tests {
                 project("shared", "1.2.3", &[("react-dom", "^18")]),
             ),
         ]);
-        let lock = super::resolve(&projects, &react_registry(), &[], None).unwrap();
+        let lock = super::resolve(&projects, &react_registry(), &[], None, &BTreeMap::new()).unwrap();
 
         let root = &lock.importers["."];
         assert_eq!(root.dependencies["hooks"], "hooks@1.0.0(react@18.3.1)");
@@ -712,7 +785,8 @@ mod tests {
                     project("shared", "1.0.0", &[]),
                 ),
             ]);
-            let error = super::resolve(&projects, &registry, &[], None).unwrap_err();
+            let error =
+                super::resolve(&projects, &registry, &[], None, &BTreeMap::new()).unwrap_err();
             assert!(format!("{error:?}").contains(message), "{spec}: {error:?}");
         }
     }

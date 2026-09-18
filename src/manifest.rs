@@ -62,6 +62,8 @@ struct HinataConfig {
     #[serde(default)]
     patched_dependencies: BTreeMap<String, String>,
     #[serde(default)]
+    overrides: BTreeMap<String, String>,
+    #[serde(default)]
     substituters: BTreeMap<String, String>,
     nixpkgs: Option<String>,
     minimum_release_age: Option<u64>,
@@ -107,6 +109,8 @@ struct PnpmWorkspace {
     build_inputs: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     patched_dependencies: BTreeMap<String, String>,
+    #[serde(default)]
+    overrides: BTreeMap<String, String>,
 }
 
 impl Manifest {
@@ -217,6 +221,13 @@ impl Manifest {
                 Ok((key, Patch { path, hash }))
             })
             .collect()
+    }
+
+    /// Ranges that replace what dependencies ask for, keyed by `name` or `name@range`.
+    pub fn overrides(&self) -> BTreeMap<String, String> {
+        let mut overrides = self.workspace.overrides.clone();
+        overrides.extend(self.hinata.overrides.clone());
+        overrides
     }
 
     /// Binary cache URLs and their public keys.

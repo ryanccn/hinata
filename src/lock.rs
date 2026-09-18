@@ -16,6 +16,9 @@ pub struct Lock {
     pub nixpkgs: Option<Nixpkgs>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<Node>,
+    /// The overrides these packages were resolved with, so that changing one resolves again.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub overrides: BTreeMap<String, String>,
     pub packages: BTreeMap<String, Package>,
     /// Nix derivations cannot depend on each other cyclically, so each of these groups is built as one.
     pub sccs: Vec<Vec<String>>,
