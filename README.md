@@ -21,6 +21,7 @@ hinata update --nixpkgs       # lock Nixpkgs again
 hinata why <pkg>              # show the routes by which a package is installed
 hinata run <script>           # run a package.json script
 hinata exec <command>         # run a command with node_modules/.bin on PATH
+hinata dlx <pkg> [args...]    # run a package's binary without installing it
 hinata push <store-uri>       # push packages built by install scripts to a binary cache
 hinata gc                     # remove stale GC roots and cached registry metadata
 ```
@@ -34,6 +35,8 @@ Installing a project doesn't let it or its dependencies reach outside the Nix sa
 - The Nixpkgs that a project chooses is evaluated purely, so it cannot read files outside the Nix store or the environment.
 - Package names, bins and integrity hashes in lockfiles are validated before they reach paths or build scripts.
 - Versions not already in the lockfile are only chosen once they have been published for a day, or for the number of minutes in `minimumReleaseAge` (`0` turns this off).
+
+`hinata dlx` cannot be configured by a project: install scripts only run for packages named by `--allow-build`, always in the sandbox, and a version must always have been published for a day.
 
 This does not cover code that the project runs later, such as scripts run with `hinata run`, or builds when the Nix sandbox is off or unavailable, as it is by default on macOS.
 
@@ -117,6 +120,8 @@ Packages are built with the Nixpkgs revision locked in `hinata.lock`. It is lock
   }
 }
 ```
+
+`hinata dlx` has no `hinata.lock`: it locks Nixpkgs from `--nixpkgs`, or otherwise from `nixpkgs-unstable`, and runs the tool under the newest Node.js in it rather than the `node` on `PATH`.
 
 `devEngines` locks Node.js from the same revision: the newest release matching the range, or failing that, the newest in a major version it allows. It builds install scripts and is linked into `node_modules/.bin`. Otherwise, native addons are built for the `node` on `PATH`:
 

@@ -19,15 +19,14 @@ use sha2::{Digest, Sha256};
 
 use crate::lock::{self, LOCKFILE, Lock, Patch};
 use crate::logging::{LogDisplay as _, plural};
-use crate::manifest::{BuildMode, Manifest};
+use crate::manifest::Manifest;
+use crate::nix::DEFAULT_NIXPKGS;
 use crate::registry::{DEFAULT_REGISTRY, HttpRegistry};
 use crate::resolve::Project;
 use crate::{impure, link, manifest, nix, pnpm, resolve, summary, trust, util};
 
 /// Installs from pnpm-lock.yaml have no hinata.lock to record Nixpkgs and Node.js in.
 const COMPAT: &str = "node_modules/.hinata.compat.json";
-/// Locked when neither hinata.nixpkgs nor flake.lock chooses Nixpkgs.
-const DEFAULT_NIXPKGS: &str = "github:NixOS/nixpkgs/nixpkgs-unstable";
 
 #[derive(Default, Serialize, Deserialize)]
 struct Compat {
@@ -93,17 +92,6 @@ impl Update {
             Update::Only(names) => names.contains(name),
         }
     }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ImporterRoots {
-    #[serde(default)]
-    dependencies: BTreeMap<String, PathBuf>,
-    #[serde(default)]
-    dev_dependencies: BTreeMap<String, PathBuf>,
-    #[serde(default)]
-    optional_dependencies: BTreeMap<String, PathBuf>,
 }
 
 pub fn run(options: &Options) -> Result<()> {
@@ -260,8 +248,7 @@ fn native_addon_node(root: &Path, lock: &Lock) -> Option<u32> {
 }
 
 fn link_importers(root: &Path, lock: &Lock, workspace: &Path, node: Option<&Path>) -> Result<()> {
-    let importer_roots: BTreeMap<String, ImporterRoots> =
-        serde_json::from_str(&fs::read_to_string(workspace.join("importers.json"))?)?;
+    let importer_roots = nix::importer_roots(workspace)?;
     for (path, importer) in &lock.importers {
         let dir = root.join(path);
         let roots = importer_roots
@@ -387,12 +374,13 @@ fn update_lock(
 
     lock::validate(&lock)?;
 
-    mark_builds(
+    let skipped = lock::mark_builds(
         &mut lock,
         &manifest.allow_builds(),
         &build_inputs,
         pnpm_only,
     );
+    warn_skipped(&skipped);
     mark_patches(&mut lock, &patches);
     if resolved {
         summary::report(&before, &lock);
@@ -521,43 +509,19 @@ fn read_projects(root: &Path, manifest: &Manifest) -> Result<BTreeMap<String, Pr
 }
 
 fn warn_missing_updates(names: &BTreeSet<String>, lock: &Lock) {
-    for name in names {
-        if !lock.packages.values().any(|package| &package.name == name) {
-            warn!(
-                "{} is not installed, so there is nothing to update",
-                name.log_display::<Yellow>()
-            );
-        }
+    for name in lock::missing_names(lock, names) {
+        warn!(
+            "{} is not installed, so there is nothing to update",
+            name.log_display::<Yellow>()
+        );
     }
 }
 
-fn mark_builds(
-    lock: &mut Lock,
-    allow_builds: &BTreeMap<String, BuildMode>,
-    build_inputs: &BTreeMap<String, Vec<String>>,
-    pnpm_only: bool,
-) {
-    let mut skipped = BTreeSet::new();
-    for package in lock.packages.values_mut() {
-        // pnpm lockfiles do not record which packages have install scripts.
-        let mode = allow_builds
-            .get(&package.name)
-            .filter(|_| pnpm_only || package.install_script);
-        package.build = mode == Some(&BuildMode::Sandboxed);
-        package.impure_build = mode == Some(&BuildMode::Impure);
-        package.build_inputs = build_inputs
-            .get(&package.name)
-            .filter(|_| package.build)
-            .cloned()
-            .unwrap_or_default();
-
-        if package.install_script && mode.is_none() {
-            skipped.insert(package.name.clone());
-        }
-    }
+fn warn_skipped(skipped: &BTreeSet<String>) {
     if skipped.is_empty() {
         return;
     }
+
     let names: Vec<_> = skipped
         .iter()
         .map(|name| name.log_display::<Yellow>().to_string())

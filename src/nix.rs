@@ -20,6 +20,9 @@ use crate::manifest;
 
 pub const FLAKE_LOCK: &str = "flake.lock";
 
+/// Locked when neither hinata.nixpkgs nor flake.lock chooses Nixpkgs.
+pub const DEFAULT_NIXPKGS: &str = "github:NixOS/nixpkgs/nixpkgs-unstable";
+
 pub const LIBRARY: [(&str, &str); 3] = [
     (
         "nix_support/default.nix",
@@ -172,6 +175,24 @@ pub fn lock_nixpkgs(flake_ref: &str) -> Result<lock::Nixpkgs> {
     shareable(flake_ref, metadata.locked).ok_or_else(|| {
         eyre!("{flake_ref} locks to a local path, which other machines cannot fetch")
     })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImporterRoots {
+    #[serde(default)]
+    pub dependencies: BTreeMap<String, PathBuf>,
+    #[serde(default)]
+    pub dev_dependencies: BTreeMap<String, PathBuf>,
+    #[serde(default)]
+    pub optional_dependencies: BTreeMap<String, PathBuf>,
+}
+
+pub fn importer_roots(workspace: &Path) -> Result<BTreeMap<String, ImporterRoots>> {
+    let path = workspace.join("importers.json");
+    let json = fs::read_to_string(&path).wrap_err_with(|| format!("reading {}", path.display()))?;
+
+    serde_json::from_str(&json).wrap_err_with(|| format!("parsing {}", path.display()))
 }
 
 /// Versions of Node.js in `nixpkgs`, keyed by attribute.

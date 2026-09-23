@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+mod dlx;
 mod edit;
 mod gc;
 mod impure;
@@ -113,6 +114,22 @@ enum Command {
         /// Package, as name or name@version
         package: String,
     },
+    /// Run a package's binary without installing it into a project
+    Dlx {
+        /// Package, as name, name@range or name@tag
+        spec: String,
+        /// Binary to run, when it is not the one named after the package
+        #[arg(long)]
+        bin: Option<String>,
+        /// Allow a package's install scripts to run, sandboxed
+        #[arg(long = "allow-build", value_name = "NAME")]
+        allow_builds: Vec<String>,
+        /// Lock Nixpkgs from this flake reference
+        #[arg(long)]
+        nixpkgs: Option<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Run a command with `node_modules/.bin` on PATH
     Exec {
         program: String,
@@ -195,6 +212,20 @@ fn main() -> Result<()> {
         }
         Command::Run { script, args } => exit_with(run::script(&cli.dir, &script, &args)?),
         Command::Why { package } => why::run(&cli.dir, &package)?,
+        Command::Dlx {
+            spec,
+            bin,
+            allow_builds,
+            nixpkgs,
+            args,
+        } => exit_with(dlx::run(
+            &cli.dir,
+            &spec,
+            bin.as_deref(),
+            &allow_builds.into_iter().collect(),
+            nixpkgs.as_deref(),
+            &args,
+        )?),
         Command::Exec { program, args } => exit_with(run::exec(&cli.dir, &program, &args)?),
         Command::Push { store, .. } => push::run(&cli.dir, store.as_deref())?,
         Command::Gc => gc::run()?,

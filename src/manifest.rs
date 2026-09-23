@@ -17,6 +17,9 @@ use crate::lock::{Patch, Specifiers};
 use crate::resolve::Project;
 use crate::util::hex;
 
+/// In minutes.
+pub const DEFAULT_MINIMUM_RELEASE_AGE: u64 = 24 * 60;
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Manifest {
@@ -242,7 +245,9 @@ impl Manifest {
 
     /// In minutes, how long ago newly chosen versions must have been published.
     pub fn minimum_release_age(&self) -> u64 {
-        self.hinata.minimum_release_age.unwrap_or(24 * 60)
+        self.hinata
+            .minimum_release_age
+            .unwrap_or(DEFAULT_MINIMUM_RELEASE_AGE)
     }
 
     /// The version range of Node.js in `devEngines.runtime`.

@@ -2,10 +2,12 @@
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use petgraph::{algo::tarjan_scc, graph::DiGraph};
 use serde::{Deserialize, Serialize};
+
+use crate::manifest::BuildMode;
 
 pub const LOCKFILE: &str = "hinata.lock";
 
@@ -184,6 +186,44 @@ pub fn validate(lock: &Lock) -> eyre::Result<()> {
     }
 
     Ok(())
+}
+
+pub fn missing_names<'n>(lock: &Lock, names: &'n BTreeSet<String>) -> Vec<&'n str> {
+    names
+        .iter()
+        .filter(|name| !lock.packages.values().any(|package| &package.name == *name))
+        .map(String::as_str)
+        .collect()
+}
+
+/// Returns the packages whose install scripts were skipped.
+pub fn mark_builds(
+    lock: &mut Lock,
+    allow_builds: &BTreeMap<String, BuildMode>,
+    build_inputs: &BTreeMap<String, Vec<String>>,
+    pnpm_only: bool,
+) -> BTreeSet<String> {
+    let mut skipped = BTreeSet::new();
+
+    for package in lock.packages.values_mut() {
+        // pnpm lockfiles do not record which packages have install scripts.
+        let mode = allow_builds
+            .get(&package.name)
+            .filter(|_| pnpm_only || package.install_script);
+        package.build = mode == Some(&BuildMode::Sandboxed);
+        package.impure_build = mode == Some(&BuildMode::Impure);
+        package.build_inputs = build_inputs
+            .get(&package.name)
+            .filter(|_| package.build)
+            .cloned()
+            .unwrap_or_default();
+
+        if package.install_script && mode.is_none() {
+            skipped.insert(package.name.clone());
+        }
+    }
+
+    skipped
 }
 
 /// Includes the uppercase letters that npm still allows in old package names.

@@ -30,7 +30,7 @@ pub fn script(dir: &Path, name: &str, args: &[String]) -> Result<ExitStatus> {
     for (event, body) in chain(&manifest.scripts, name) {
         let line = script_line(&event, body, name, args);
         info!("running {} {}", event.log_display::<Blue>(), line.dimmed());
-        status = command(&root, &manifest, "sh")?
+        status = project_command(&root, &manifest, "sh")?
             .arg("-c")
             .arg(&line)
             .env("npm_lifecycle_event", &event)
@@ -76,26 +76,35 @@ pub fn exec(dir: &Path, program: &str, args: &[String]) -> Result<ExitStatus> {
         program.log_display::<Blue>(),
         "node_modules/.bin".log_display::<Blue>()
     );
-    command(&root, &manifest, program)?
+    project_command(&root, &manifest, program)?
         .args(args)
         .status()
         .wrap_err_with(|| format!("running {program}"))
 }
 
-fn command(root: &Path, manifest: &Manifest, program: &str) -> Result<Command> {
+pub fn command(cwd: &Path, bins: &Path, program: &str) -> Result<Command> {
     let path = std::env::var_os("PATH").unwrap_or_default();
-    let paths = std::iter::once(root.join("node_modules/.bin")).chain(std::env::split_paths(&path));
+    let paths = std::iter::once(bins.to_path_buf()).chain(std::env::split_paths(&path));
+
     let mut command = Command::new(program);
     command
-        .current_dir(root)
+        .current_dir(cwd)
         .env("PATH", std::env::join_paths(paths)?)
         .env("INIT_CWD", std::env::current_dir()?);
+
+    Ok(command)
+}
+
+fn project_command(root: &Path, manifest: &Manifest, program: &str) -> Result<Command> {
+    let mut command = command(root, &root.join("node_modules/.bin"), program)?;
+
     if let Some(name) = &manifest.name {
         command.env("npm_package_name", name);
     }
     if let Some(version) = &manifest.version {
         command.env("npm_package_version", version);
     }
+
     Ok(command)
 }
 
